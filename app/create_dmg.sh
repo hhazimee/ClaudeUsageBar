@@ -1,7 +1,7 @@
 #!/bin/bash
 
-APP_NAME="ClaudeUsageBar"
-DMG_NAME="${APP_NAME}-Installer"
+APP_NAME="Claude Usage Multi"
+DMG_NAME="ClaudeUsageMulti-Installer"
 VERSION="1.1"
 
 # Create a temporary directory for DMG contents

@@ -10,7 +10,7 @@ rm -rf build
 mkdir -p build
 
 # Create app bundle structure first
-APP_NAME="ClaudeUsageBar.app"
+APP_NAME="Claude Usage Multi.app"
 APP_PATH="build/$APP_NAME"
 
 mkdir -p "$APP_PATH/Contents/MacOS"
@@ -70,10 +70,12 @@ find "$APP_PATH" -name '._*' -delete 2>/dev/null
 find "$APP_PATH" -name '.DS_Store' -delete 2>/dev/null
 dot_clean "$APP_PATH" 2>/dev/null
 
-# Sign with Developer ID certificate. NEVER silently fall back to ad-hoc — that
-# fails notarization later. If real signing fails, error out loudly.
-DEVELOPER_ID="Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)"
-if codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$APP_PATH"; then
+# Sign the bundle. Release builds need a real Developer ID (ad-hoc signatures fail
+# notarization), but a local build just needs to launch, so fall back to ad-hoc
+# unless RELEASE=1 is set.
+DEVELOPER_ID="${SIGN_IDENTITY:-Developer ID Application: Linkko Technology Pte Ltd (Q467HQ5432)}"
+
+if codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$APP_PATH" 2>/dev/null; then
     echo "✅ App signed with Developer ID"
     if codesign --verify --verbose=2 "$APP_PATH" 2>&1 | grep -q "valid on disk"; then
         echo "✅ Signature verified"
@@ -81,13 +83,35 @@ if codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$APP_PATH";
         echo "❌ Signature verification failed — fix before shipping" >&2
         exit 1
     fi
-else
+elif [ "${RELEASE:-0}" = "1" ]; then
     echo "❌ Developer ID signing failed. NOT falling back to ad-hoc (would break notarization)." >&2
     echo "   Fix the cause above (often: stale xattrs / ._files / cert not in keychain) and re-run." >&2
     exit 1
+else
+    echo "⚠️  No Developer ID cert found, signing ad-hoc for local use."
+    echo "   Set RELEASE=1 to make missing signing a hard failure."
+    codesign --force --deep --sign - "$APP_PATH" || exit 1
 fi
 
 echo "Build successful!"
 echo "App bundle created at: $APP_PATH"
-echo "Launching app..."
-open "$APP_PATH"
+
+# Install to /Applications and launch from there. macOS only grants notification
+# permission to apps registered with Launch Services, and the FIRST launch of a
+# bundle id from an unregistered location (like build/) permanently marks it
+# denied. So never open the build/ copy directly.
+INSTALL_PATH="/Applications/$APP_NAME"
+if [ "${INSTALL:-1}" = "1" ]; then
+    echo "Installing to $INSTALL_PATH..."
+    pkill -f "$INSTALL_PATH/Contents/MacOS" 2>/dev/null
+    sleep 1
+    rm -rf "$INSTALL_PATH"
+    cp -R "$APP_PATH" "/Applications/"
+    xattr -cr "$INSTALL_PATH"
+    codesign --force --deep --sign - "$INSTALL_PATH" 2>/dev/null
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$INSTALL_PATH"
+    echo "Launching from /Applications..."
+    open "$INSTALL_PATH"
+else
+    echo "INSTALL=0 set; not installing. Do not open build/ directly (breaks notifications)."
+fi

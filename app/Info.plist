@@ -7,11 +7,13 @@
 	<key>CFBundleExecutable</key>
 	<string>ClaudeUsageBar</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.claude.usagebar</string>
+	<string>com.hazime.claudeusagemulti</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>ClaudeUsageBar</string>
+	<string>Claude Usage Multi</string>
+	<key>CFBundleDisplayName</key>
+	<string>Claude Usage Multi</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

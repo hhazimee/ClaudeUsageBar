@@ -1041,16 +1041,23 @@ class UsageManager: ObservableObject {
     /// Set when OAuth failed but a stored cookie is keeping numbers flowing.
     @Published var usingCookieFallback: Bool = false
 
+    /// True between opening the browser and the code being pasted. Held here,
+    /// not in the view, because the popover is transient and tears the view
+    /// down the moment the browser takes focus.
+    @Published private(set) var awaitingPasteCode: Bool = false
+
     /// One notification per failure, not one per refresh cycle.
     private var reauthNotified = false
 
-    var authSourceLabel: String {
+    /// Which credential is in use. nil when there is nothing to say: a signed-in
+    /// account whose email is not known yet needs no line telling it so.
+    var authSourceLabel: String? {
         // The fallback state is the more specific of the two and they are set
         // together, so it has to be tested first or it never renders.
         if usingCookieFallback { return "Session cookie (sign-in expired)" }
         if needsReauth { return "Sign in again" }
-        if account.hasOAuth { return account.accountEmail ?? "Signed in" }
-        return account.hasCookie ? "Session cookie" : "Not configured"
+        if account.hasOAuth { return account.accountEmail }
+        return account.hasCookie ? "Session cookie" : nil
     }
 
     var hasCredential: Bool { account.hasOAuth || account.hasCookie }
@@ -1072,6 +1079,7 @@ class UsageManager: ObservableObject {
     func beginPasteSignIn() {
         let request = OAuthClient.authorizationRequest(redirectURI: OAuthEndpoints.pasteRedirect)
         pendingRequest = request
+        awaitingPasteCode = true
         NSWorkspace.shared.open(request.url)
     }
 
@@ -1117,6 +1125,7 @@ class UsageManager: ObservableObject {
                     self.reauthNotified = false
                     self.usingCookieFallback = false
                     self.pendingRequest = nil
+                    self.awaitingPasteCode = false
                     self.onAccountEdited?(self.account)
                     self.fetchUsage()
                     completion(nil)
@@ -1133,6 +1142,8 @@ class UsageManager: ObservableObject {
         needsReauth = false
         reauthNotified = false
         usingCookieFallback = false
+        pendingRequest = nil
+        awaitingPasteCode = false
         onAccountEdited?(account)
         fetchUsage()
     }
@@ -3184,7 +3195,6 @@ struct AccountUsageSection: View {
     @State private var showingCookieInput: Bool = false
     @State private var hasSavedCookie: Bool = false
     @State private var pasteInput: String = ""
-    @State private var awaitingPaste: Bool = false
     @State private var showCookie: Bool = false
 
     private var account: Account { manager.account }
@@ -3204,7 +3214,6 @@ struct AccountUsageSection: View {
                 Spacer()
                 if account.hasOAuth {
                     Button("Sign out") {
-                        awaitingPaste = false
                         pasteInput = ""
                         manager.signOut()
                     }
@@ -3213,26 +3222,19 @@ struct AccountUsageSection: View {
                 }
             }
 
-            if account.hasOAuth, !manager.needsReauth {
-                Text(account.accountEmail ?? "Signed in")
+            if account.hasOAuth, !manager.needsReauth, let email = account.accountEmail {
+                Text(email)
                     .font(.caption2)
                     .foregroundColor(Color.secondaryText)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
 
-            Button(account.hasOAuth && !manager.needsReauth ? "Sign in again" : "Sign in with Claude") {
-                manager.beginPasteSignIn()
-                awaitingPaste = true
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-
-            if awaitingPaste {
+            if manager.awaitingPasteCode {
                 // The one line that earns its place: signing a second account
                 // in from a normal window silently re-authorises the first,
                 // and nothing on screen would show that.
-                Text("For a second account, sign in from a private window.")
+                Text("For a second account, use a private window.")
                     .font(.caption2)
                     .foregroundColor(Color.secondaryText)
 
@@ -3240,14 +3242,28 @@ struct AccountUsageSection: View {
                     .frame(height: 40)
                     .cornerRadius(4)
 
-                Button("Finish sign-in") {
-                    manager.completeSignIn(paste: pasteInput) { problem in
-                        if problem == nil {
-                            pasteInput = ""
-                            awaitingPaste = false
+                HStack(spacing: 8) {
+                    Button("Finish sign-in") {
+                        manager.completeSignIn(paste: pasteInput) { problem in
+                            if problem == nil { pasteInput = "" }
+                            manager.errorMessage = problem ?? "Signed in, fetching..."
                         }
-                        manager.errorMessage = problem ?? "Signed in, fetching..."
                     }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+
+                    // Restarting mints a new request and kills the code the
+                    // user is holding, so it never happens by accident.
+                    Button("Start over") {
+                        pasteInput = ""
+                        manager.beginPasteSignIn()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            } else {
+                Button(account.hasOAuth ? "Sign in again" : "Sign in with Claude") {
+                    manager.beginPasteSignIn()
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
@@ -3358,14 +3374,6 @@ struct AccountUsageSection: View {
                     .font(.caption)
                     .foregroundColor(.orange)
                     .padding(.bottom, 8)
-            }
-
-            // Only show usage if data has been fetched
-            if !manager.hasFetchedData {
-                Text("Sign in below to get started.")
-                    .font(.subheadline)
-                    .foregroundColor(Color.secondaryText)
-                    .padding(.vertical, 8)
             }
 
             // Session Usage
@@ -3545,14 +3553,14 @@ struct AccountUsageSection: View {
             }
             // Which credential is actually being used, so a silent fallback
             // from a dead token to a cookie is visible rather than mysterious.
-            if manager.hasCredential {
-                Text(manager.authSourceLabel)
+            if let authSource = manager.authSourceLabel {
+                Text(authSource)
                     .font(.caption2)
                     .foregroundColor(manager.needsReauth ? .orange : Color.secondaryText)
                     .opacity(manager.needsReauth ? 1 : 0.7)
             }
 
-            Button(showingCookieInput ? "Hide Sign-in" : "Set Sign-in") {
+            Button(showingCookieInput ? "Hide" : "Sign in") {
                 showingCookieInput.toggle()
             }
             .buttonStyle(.borderless)
@@ -3575,7 +3583,9 @@ struct AccountUsageSection: View {
             sessionCookieInput = ""
             hasSavedCookie = account.hasCookie
             // An account already leaning on its cookie shows that section open.
-            showCookie = manager.usingCookieFallback
+            // Only ever opens: .onAppear re-runs on every popover re-show and
+            // must not close a section the user opened by hand.
+            if manager.usingCookieFallback { showCookie = true }
         }
         .onChange(of: manager.usingCookieFallback) { isFallingBack in
             if isFallingBack { showCookie = true }

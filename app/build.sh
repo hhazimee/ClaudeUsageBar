@@ -109,8 +109,11 @@ if [ "${INSTALL:-1}" = "1" ]; then
     sleep 1
     rm -rf "$INSTALL_PATH"
     cp -R "$APP_PATH" "/Applications/"
+    # Do not re-sign here. The bundle is already signed above, and replacing
+    # that with an ad-hoc signature gives the app no stable identity, which
+    # makes macOS prompt for keychain access on every rebuild.
     xattr -cr "$INSTALL_PATH"
-    codesign --force --deep --sign - "$INSTALL_PATH" 2>/dev/null
+    codesign --verify "$INSTALL_PATH" || echo "⚠️  Installed copy is unsigned; keychain access will prompt."
     /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$INSTALL_PATH"
     echo "Launching from /Applications..."
     open "$INSTALL_PATH"

@@ -371,7 +371,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
 
             title.append(NSAttributedString(
                 string: manager.account.emoji + " ",
-                attributes: [.font: NSFont.systemFont(ofSize: 11)]
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 11),
+                    .foregroundColor: manager.needsReauth
+                        ? NSColor.labelColor.withAlphaComponent(0.4)
+                        : NSColor.labelColor
+                ]
             ))
 
             let hasData = manager.hasFetchedData
@@ -3180,139 +3185,79 @@ struct AccountUsageSection: View {
     @State private var sessionCookieInput: String = ""
     @State private var showingCookieInput: Bool = false
     @State private var hasSavedCookie: Bool = false
-    @State private var tokenInput: String = ""
-
-    /// Claude Code logins found in the keychain, with the email each resolves
-    /// to once looked up. Populated when the sign-in section is opened.
-    @State private var discoveredLogins: [DiscoveredLogin] = []
-    @State private var isDiscovering: Bool = false
-
-    /// A keychain credential plus whatever the app has learned about it.
-    struct DiscoveredLogin: Identifiable {
-        let credential: ClaudeCodeKeychain.Credential
-        var email: String?
-        var problem: String?
-
-        var id: String { credential.service + "|" + credential.account }
-    }
+    @State private var pasteInput: String = ""
+    @State private var awaitingPaste: Bool = false
+    @State private var showCookie: Bool = false
 
     private var account: Account { manager.account }
 
     // MARK: - Sign-in
 
-    /// Binding to the login Claude Code already holds. Nothing to paste, and
-    /// it keeps working through refreshes because the keychain is re-read on
-    /// every fetch.
+    /// The only sign-in route: the browser prints a code, the user pastes it
+    /// back. Anthropic rejects loopback redirects for this client, so there is
+    /// no callback to catch.
     @ViewBuilder
-    private var claudeCodeLoginSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Claude Code login")
-                .font(.caption)
-                .fontWeight(.semibold)
-
-            if let service = account.keychainService {
-                HStack(spacing: 6) {
-                    Text(account.accountEmail ?? service)
-                        .font(.caption2)
-                        .foregroundColor(Color.secondaryText)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    Button("Unbind") {
-                        manager.unbindKeychainLogin()
-                        manager.fetchUsage()
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                }
-            } else if isDiscovering {
-                Text("Reading keychain...")
-                    .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-            } else if discoveredLogins.isEmpty {
-                Text("No Claude Code login found. Run `claude auth login` in Terminal, then reopen this.")
-                    .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-            } else {
-                ForEach(discoveredLogins) { login in
-                    HStack(spacing: 6) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(login.email ?? login.credential.service)
-                                .font(.caption2)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            if let problem = login.problem {
-                                Text(problem)
-                                    .font(.caption2)
-                                    .foregroundColor(Color.secondaryText)
-                                    .opacity(0.8)
-                            }
-                        }
-                        Spacer()
-                        Button("Use") {
-                            if let problem = manager.bindKeychainLogin(login.credential, email: login.email) {
-                                manager.errorMessage = problem
-                                return
-                            }
-                            manager.fetchUsage()
-                            manager.errorMessage = "Signed in, fetching..."
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                        .disabled(login.credential.isExpired)
-                    }
-                }
-            }
-        }
-    }
-
-    /// A long-lived token, for accounts Claude Code is not signed into.
-    @ViewBuilder
-    private var setupTokenSection: some View {
+    private var signInSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Setup token")
+                Text("Sign in")
                     .font(.caption)
                     .fontWeight(.semibold)
                 Spacer()
-                if !(account.oauthToken ?? "").isEmpty {
-                    Button("Clear") {
-                        tokenInput = ""
-                        manager.clearOAuthToken()
+                if account.hasOAuth {
+                    Button("Sign out") {
+                        awaitingPaste = false
+                        pasteInput = ""
+                        manager.signOut()
                     }
                     .buttonStyle(.borderless)
                     .font(.caption2)
                 }
             }
 
-            Text("Run `claude setup-token` in Terminal and paste what it prints. Lasts about a year.")
-                .font(.caption2)
-                .foregroundColor(Color.secondaryText)
+            if account.hasOAuth, !manager.needsReauth {
+                Text(account.accountEmail ?? "Signed in")
+                    .font(.caption2)
+                    .foregroundColor(Color.secondaryText)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
 
-            PasteableTextField(
-                text: $tokenInput,
-                placeholder: (account.oauthToken ?? "").isEmpty
-                    ? "sk-ant-oat..."
-                    : "A token is saved. Paste a new one to replace it."
-            )
-            .frame(height: 40)
-            .cornerRadius(4)
-
-            Button("Save Token & Fetch") {
-                if let problem = manager.saveOAuthToken(tokenInput) {
-                    manager.errorMessage = problem
-                    return
-                }
-                tokenInput = ""
-                manager.fetchUsage()
-                manager.errorMessage = "Token saved, fetching..."
+            Button(account.hasOAuth && !manager.needsReauth ? "Sign in again" : "Sign in with Claude") {
+                manager.beginPasteSignIn()
+                awaitingPaste = true
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
+
+            if awaitingPaste {
+                // The one line that earns its place: signing a second account
+                // in from a normal window silently re-authorises the first,
+                // and nothing on screen would show that.
+                Text("For a second account, sign in from a private window.")
+                    .font(.caption2)
+                    .foregroundColor(Color.secondaryText)
+
+                PasteableTextField(text: $pasteInput, placeholder: "Paste code")
+                    .frame(height: 40)
+                    .cornerRadius(4)
+
+                Button("Finish sign-in") {
+                    manager.completeSignIn(paste: pasteInput) { problem in
+                        if problem == nil {
+                            pasteInput = ""
+                            awaitingPaste = false
+                        }
+                        manager.errorMessage = problem ?? "Signed in, fetching..."
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+            }
         }
     }
 
-    /// The original cookie route, kept as the fallback when no token works.
+    /// The original cookie route, kept as the fallback when sign-in fails.
     @ViewBuilder
     private var cookieSection: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -3386,39 +3331,18 @@ struct AccountUsageSection: View {
         }
     }
 
-    /// Lists the Claude Code logins in the keychain and resolves each one's
-    /// email, so the user picks an account rather than an opaque item name.
-    private func discoverClaudeCodeLogins() {
-        guard account.keychainService == nil, !isDiscovering else { return }
-        isDiscovering = true
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            let credentials = ClaudeCodeKeychain.discover()
-
-            DispatchQueue.main.async {
-                discoveredLogins = credentials.map { credential in
-                    DiscoveredLogin(
-                        credential: credential,
-                        email: nil,
-                        problem: credential.isExpired
-                            ? "Expired. Run Claude Code once to refresh it."
-                            : nil
-                    )
-                }
-                isDiscovering = false
-
-                // Name each login. Without this they read as
-                // "Claude Code-credentials-a4244b51", which picks nothing.
-                for login in discoveredLogins where !login.credential.isExpired {
-                    manager.fetchOAuthProfile(login.credential.accessToken) { email, problem in
-                        DispatchQueue.main.async {
-                            guard let index = discoveredLogins.firstIndex(where: { $0.id == login.id }) else { return }
-                            discoveredLogins[index].email = email
-                            if email == nil { discoveredLogins[index].problem = problem }
-                        }
-                    }
-                }
+    /// The cookie route is the fallback now, so it sits behind a disclosure
+    /// instead of competing with sign-in.
+    @ViewBuilder
+    private var cookieFallbackSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button(showCookie ? "Hide session cookie" : "Use a session cookie instead") {
+                showCookie.toggle()
             }
+            .buttonStyle(.borderless)
+            .font(.caption2)
+
+            if showCookie { cookieSection }
         }
     }
 
@@ -3440,7 +3364,7 @@ struct AccountUsageSection: View {
 
             // Only show usage if data has been fetched
             if !manager.hasFetchedData {
-                Text("👋 Welcome! Set your session cookie below to get started.")
+                Text("Sign in below to get started.")
                     .font(.subheadline)
                     .foregroundColor(Color.secondaryText)
                     .padding(.vertical, 8)
@@ -3626,8 +3550,8 @@ struct AccountUsageSection: View {
             if manager.hasCredential {
                 Text(manager.authSourceLabel)
                     .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-                    .opacity(0.7)
+                    .foregroundColor(manager.needsReauth ? .orange : Color.secondaryText)
+                    .opacity(manager.needsReauth ? 1 : 0.7)
             }
 
             Button(showingCookieInput ? "Hide Sign-in" : "Set Sign-in") {
@@ -3638,11 +3562,9 @@ struct AccountUsageSection: View {
 
             if showingCookieInput {
                 VStack(alignment: .leading, spacing: 12) {
-                    claudeCodeLoginSection
+                    signInSection
                     Divider()
-                    setupTokenSection
-                    Divider()
-                    cookieSection
+                    cookieFallbackSection
                 }
                 .padding(8)
                 .background(Color.secondary.opacity(0.1))
@@ -3653,13 +3575,12 @@ struct AccountUsageSection: View {
         }
         .onAppear {
             sessionCookieInput = ""
-            tokenInput = ""
             hasSavedCookie = account.hasCookie
+            // An account already leaning on its cookie shows that section open.
+            showCookie = manager.usingCookieFallback
         }
-        .onChange(of: showingCookieInput) { isOpen in
-            // Reading the keychain can prompt, so only do it when the user
-            // has actually asked to change the sign-in.
-            if isOpen { discoverClaudeCodeLogins() }
+        .onChange(of: manager.usingCookieFallback) { isFallingBack in
+            if isFallingBack { showCookie = true }
         }
     }
 
@@ -3695,6 +3616,7 @@ struct AccountUsageSection: View {
         HStack(spacing: 6) {
             Text(account.emoji)
                 .font(.system(size: 13))
+                .opacity(manager.needsReauth ? 0.4 : 1)
             Text(account.displayName)
                 .font(.subheadline)
                 .fontWeight(.semibold)

@@ -707,33 +707,30 @@ struct Account: Codable, Identifiable, Equatable {
     var name: String
     var emoji: String
     var colorHex: String
-    var cookie: String
 
-    // MARK: OAuth
+    // MARK: Credentials
     //
-    // Optional so accounts saved before OAuth support decode unchanged: a
-    // synthesised decoder treats a missing key as nil only for optionals.
+    // Nothing secret lives here. Tokens and the session cookie are in the
+    // account's keychain item, addressed by `id`. The fields below are only
+    // what the UI needs to draw the account without opening the keychain.
 
-    /// A long-lived token pasted from `claude setup-token`.
-    var oauthToken: String? = nil
+    /// True once the account has signed in. Kept here so a row can be drawn
+    /// without a keychain read on every SwiftUI update.
+    var hasOAuth: Bool = false
 
-    /// Keychain service name of a Claude Code login this account reads, e.g.
-    /// "Claude Code-credentials". Set when the account is bound to whichever
-    /// account Claude Code itself is signed into.
-    var keychainService: String? = nil
+    /// True when a session cookie is stored for this account. Cached here so a
+    /// SwiftUI row can be drawn without a synchronous keychain read.
+    var hasCookie: Bool = false
 
-    /// Keychain account attribute for the item above. Several items share a
-    /// service name, so the pair is needed to address one.
-    var keychainAccount: String? = nil
-
-    /// Email the bound credential last resolved to, used to notice that Claude
-    /// Code has been signed into a different account since the binding.
+    /// Email the account's grant resolved to, shown on its row.
     var accountEmail: String? = nil
 
-    /// Hash of the access token the email above was verified against. The
-    /// profile is re-checked only when the stored token changes, which happens
-    /// on a refresh or an account switch, not on every fetch.
-    var verifiedTokenHash: String? = nil
+    // Legacy fields. Decoded so accounts saved before the keychain move can be
+    // migrated, then blanked. Nothing reads them after `migrateSecretsToKeychain`.
+    var cookie: String = ""
+    var oauthToken: String? = nil
+    var keychainService: String? = nil
+    var keychainAccount: String? = nil
 
     static let palette: [String] = [
         "#3B82F6", // blue
@@ -783,7 +780,63 @@ enum AccountStore {
     /// a different domain and have to be carried across once.
     private static let upstreamDomain = "com.claude.usagebar"
 
-    static func load() -> [Account] {
+    static func load(store: CredentialStore = CredentialStore()) -> [Account] {
+        var accounts = loadFromDefaults()
+        migrateSecretsToKeychain(&accounts, store: store)
+        return accounts
+    }
+
+    /// Moves cookies and pasted setup tokens out of the preferences plist and
+    /// into each account's keychain item, once.
+    ///
+    /// Accounts bound to a Claude Code login lose the binding: that token
+    /// belongs to the CLI, and refreshing it would rotate the CLI's own
+    /// refresh token and sign it out. Those accounts have to sign in again.
+    static func migrateSecretsToKeychain(_ accounts: inout [Account], store: CredentialStore) {
+        var changed = false
+
+        for index in accounts.indices {
+            var account = accounts[index]
+            let hadPlaintext = !account.cookie.isEmpty || !(account.oauthToken ?? "").isEmpty
+            let hadBinding = account.keychainService != nil
+            guard hadPlaintext || hadBinding else { continue }
+
+            var credential = store.load(account.id) ?? StoredCredential()
+
+            if !account.cookie.isEmpty, (credential.cookie ?? "").isEmpty {
+                credential.cookie = account.cookie
+            }
+            // A setup token is long-lived and needs no refresh, so it becomes
+            // an OAuth grant with no refresh token and no expiry.
+            if let token = account.oauthToken, !token.isEmpty, credential.oauth == nil {
+                credential.oauth = OAuthTokens(accessToken: token, email: account.accountEmail)
+            }
+
+            do {
+                try store.save(credential, for: account.id)
+            } catch {
+                NSLog("\u{274C} Could not move '\(account.displayName)' credentials to the keychain: \(error)")
+                continue
+            }
+
+            account.hasOAuth = credential.oauth != nil
+            account.hasCookie = !(credential.cookie ?? "").isEmpty
+            account.cookie = ""
+            account.oauthToken = nil
+            account.keychainService = nil
+            account.keychainAccount = nil
+            accounts[index] = account
+            changed = true
+
+            if hadBinding {
+                NSLog("\u{1F511} '\(account.displayName)' was bound to a Claude Code login and needs to sign in again")
+            }
+        }
+
+        if changed { save(accounts) }
+    }
+
+    private static func loadFromDefaults() -> [Account] {
         if let data = UserDefaults.standard.data(forKey: key),
            let accounts = try? JSONDecoder().decode([Account].self, from: data),
            !accounts.isEmpty {

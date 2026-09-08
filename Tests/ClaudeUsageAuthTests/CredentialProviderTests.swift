@@ -223,8 +223,21 @@ struct CredentialProviderTests {
         let provider = CredentialProvider(store: store, client: refresher, now: { self.now })
         async let outcome = await_(provider, id)
         try await Task.sleep(nanoseconds: 200_000_000)
-        try provider.mutate(id) { $0.cookie = "sk-ant-sid-example" }
-        refresher.release()
+
+        try provider.mutate(id) { credential in
+            // Release from inside the change, so the refresh commits while
+            // this write is in flight. That is the window being guarded, and
+            // it is the reason the release cannot sit outside the call: a
+            // mutate that runs start to finish before the refresh commits
+            // straddles nothing and passes with the bug present.
+            //
+            // The pause gives a read-then-write across two queue hops every
+            // chance to let the refresh land between its two halves. `mutate`
+            // holds the queue throughout, so the refresh waits instead.
+            refresher.release()
+            Thread.sleep(forTimeInterval: 0.2)
+            credential.cookie = "sk-ant-sid-example"
+        }
 
         #expect(await outcome == .token("renewed"))
         // Both writes survive. A read-then-write across two queue hops would

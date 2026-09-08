@@ -34,7 +34,11 @@ public struct CredentialStore {
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         guard status == errSecSuccess, let data = result as? Data else { return nil }
-        return try? JSONDecoder().decode(StoredCredential.self, from: data)
+        guard let credential = try? JSONDecoder().decode(StoredCredential.self, from: data) else {
+            NSLog("\u{274C} Keychain item for \(id) could not be decoded")
+            return nil
+        }
+        return credential
     }
 
     public func save(_ credential: StoredCredential, for id: UUID) throws {

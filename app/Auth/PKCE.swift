@@ -24,10 +24,11 @@ public enum PKCE {
         return base64URL(Data(bytes))
     }
 
-    /// 16 random bytes for the `state` parameter, which guards the callback
-    /// against a code from a different sign-in being accepted.
+    /// 32 random bytes for the `state` parameter, which guards the callback
+    /// against a code from a different sign-in being accepted. The authorize
+    /// page rejects a shorter state as a malformed request.
     public static func randomState() -> String {
-        var bytes = [UInt8](repeating: 0, count: 16)
+        var bytes = [UInt8](repeating: 0, count: 32)
         let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
         precondition(status == errSecSuccess, "SecRandomCopyBytes failed: \(status)")
         return base64URL(Data(bytes))

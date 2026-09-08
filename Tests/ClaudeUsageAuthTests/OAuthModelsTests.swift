@@ -58,6 +58,20 @@ struct TokenResponseTests {
         #expect(tokens.refreshToken == nil)
         #expect(tokens.expiresAt == nil)
     }
+
+    @Test func decodesTheAccountTheTokenBelongsTo() throws {
+        let response = try decode("""
+        {"access_token":"at","expires_in":28800,"token_type":"Bearer",
+         "account":{"uuid":"u1","email_address":"haz@example.com"}}
+        """)
+        #expect(response.accountEmail == "haz@example.com")
+        #expect(response.tokens(now: now).email == "haz@example.com")
+    }
+
+    @Test func decodesAResponseWithNoAccount() throws {
+        let response = try decode(#"{"access_token":"at","token_type":"Bearer"}"#)
+        #expect(response.accountEmail == nil)
+    }
 }
 
 @Suite("Callback parsing")

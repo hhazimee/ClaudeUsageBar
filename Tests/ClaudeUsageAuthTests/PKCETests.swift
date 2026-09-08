@@ -24,4 +24,10 @@ struct PKCETests {
         #expect(a.count >= 43)   // RFC 7636 minimum
         #expect(a.count <= 128)  // RFC 7636 maximum
     }
+
+    @Test func statesAreThirtyTwoBytesEncoded() {
+        // A shorter state is rejected by the authorize page as a malformed request.
+        #expect(PKCE.randomState().count == 43)
+        #expect(PKCE.randomState() != PKCE.randomState())
+    }
 }

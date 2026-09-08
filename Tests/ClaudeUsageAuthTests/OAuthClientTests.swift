@@ -68,6 +68,15 @@ struct AuthorizationRequestTests {
     }
 }
 
+@Suite("OAuth transport")
+struct OAuthTransportTests {
+    @Test func carriesAUserAgentCloudflareAccepts() {
+        // Without this the token endpoint answers 403 error 1010.
+        #expect(!OAuthEndpoints.userAgent.isEmpty)
+        #expect(OAuthEndpoints.userAgent.contains("claude-cli"))
+    }
+}
+
 @Suite("OAuth errors")
 struct OAuthErrorTests {
     @Test func fourHundredOneCountsAsAnAuthFailure() {

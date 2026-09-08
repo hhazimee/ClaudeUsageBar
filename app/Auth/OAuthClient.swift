@@ -10,7 +10,11 @@ public enum OAuthEndpoints {
     /// Used when the user signs in somewhere the app cannot listen, such as a
     /// private window. The page prints `code#state` to paste back.
     public static let pasteRedirect = "https://platform.claude.com/oauth/code/callback"
-    public static let scopes = "user:inference"
+    /// The usage endpoint requires `user:profile`.
+    public static let scopes = "user:profile user:inference"
+    /// The token endpoint is behind Cloudflare, which rejects unrecognised
+    /// agents with error 1010. This one is accepted.
+    public static let userAgent = "claude-cli/2.1.263 (external, cli)"
 }
 
 public struct AuthorizationRequest {
@@ -111,6 +115,7 @@ public final class OAuthClient: TokenRefreshing {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(OAuthEndpoints.userAgent, forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 30
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 

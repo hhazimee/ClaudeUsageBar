@@ -48,23 +48,40 @@ public struct StoredCredential: Codable, Equatable {
 
 /// The token endpoint's response shape.
 public struct TokenResponse: Decodable {
+    /// The account the token belongs to, carried inline so a sign-in can
+    /// label the account with no extra network call.
+    public struct Account: Decodable {
+        public let uuid: String?
+        public let emailAddress: String?
+
+        enum CodingKeys: String, CodingKey {
+            case uuid
+            case emailAddress = "email_address"
+        }
+    }
+
     public let accessToken: String
     public let refreshToken: String?
     public let expiresIn: Double?
     public let scope: String?
+    public let account: Account?
 
     enum CodingKeys: String, CodingKey {
         case accessToken = "access_token"
         case refreshToken = "refresh_token"
         case expiresIn = "expires_in"
         case scope
+        case account
     }
+
+    public var accountEmail: String? { account?.emailAddress }
 
     public func tokens(now: Date = Date()) -> OAuthTokens {
         OAuthTokens(accessToken: accessToken,
                     refreshToken: refreshToken,
                     expiresAt: expiresIn.map { now.addingTimeInterval($0) },
-                    scope: scope)
+                    scope: scope,
+                    email: accountEmail)
     }
 }
 

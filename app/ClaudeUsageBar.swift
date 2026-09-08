@@ -1055,12 +1055,10 @@ class UsageManager: ObservableObject {
         // The fallback state is the more specific of the two and they are set
         // together, so it has to be tested first or it never renders.
         if usingCookieFallback { return "Session cookie (sign-in expired)" }
-        if needsReauth { return "Sign in again" }
+        if needsReauth { return "Sign-in expired" }
         if account.hasOAuth { return account.accountEmail }
         return account.hasCookie ? "Session cookie" : nil
     }
-
-    var hasCredential: Bool { account.hasOAuth || account.hasCookie }
 
     private func reportReauthNeeded() {
         guard !reauthNotified else { return }
@@ -1132,6 +1130,12 @@ class UsageManager: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Abandons a sign-in that was started but never pasted back.
+    func cancelSignIn() {
+        pendingRequest = nil
+        awaitingPasteCode = false
     }
 
     /// Drops the OAuth grant. The cookie, if there is one, stays.
@@ -3252,17 +3256,17 @@ struct AccountUsageSection: View {
                     .buttonStyle(.borderedProminent)
                     .controlSize(.small)
 
-                    // Restarting mints a new request and kills the code the
-                    // user is holding, so it never happens by accident.
-                    Button("Start over") {
+                    // The only way out of a pending sign-in, and the way to
+                    // start a fresh one: the sign-in button returns after this.
+                    Button("Cancel") {
                         pasteInput = ""
-                        manager.beginPasteSignIn()
+                        manager.cancelSignIn()
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                 }
             } else {
-                Button(account.hasOAuth ? "Sign in again" : "Sign in with Claude") {
+                Button("Sign in with Claude") {
                     manager.beginPasteSignIn()
                 }
                 .buttonStyle(.borderedProminent)
@@ -3560,13 +3564,18 @@ struct AccountUsageSection: View {
                     .opacity(manager.needsReauth ? 1 : 0.7)
             }
 
-            Button(showingCookieInput ? "Hide" : "Sign in") {
-                showingCookieInput.toggle()
+            // Hidden while a code is outstanding: the panel is forced open
+            // below, so the toggle could not do what its label says. Cancel is
+            // the way out.
+            if !manager.awaitingPasteCode {
+                Button(showingCookieInput ? "Hide" : "Sign in") {
+                    showingCookieInput.toggle()
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
             }
-            .buttonStyle(.borderless)
-            .font(.caption)
 
-            if showingCookieInput {
+            if showingCookieInput || manager.awaitingPasteCode {
                 VStack(alignment: .leading, spacing: 12) {
                     signInSection
                     Divider()

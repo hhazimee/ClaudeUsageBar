@@ -713,13 +713,15 @@ struct Account: Codable, Identifiable, Equatable {
     // Nothing secret lives here. Tokens and the session cookie are in the
     // account's keychain item, addressed by `id`. The fields below are only
     // what the UI needs to draw the account without opening the keychain.
+    // Both are non-optional with a default, so accounts saved before these
+    // existed need the custom decoder below: the synthesized one throws
+    // keyNotFound for a missing non-optional key rather than using the default.
 
     /// True once the account has signed in. Kept here so a row can be drawn
     /// without a keychain read on every SwiftUI update.
     var hasOAuth: Bool = false
 
-    /// True when a session cookie is stored for this account. Cached here so a
-    /// SwiftUI row can be drawn without a synchronous keychain read.
+    /// Same, for whether a session cookie is stored.
     var hasCookie: Bool = false
 
     /// Email the account's grant resolved to, shown on its row.
@@ -731,6 +733,55 @@ struct Account: Codable, Identifiable, Equatable {
     var oauthToken: String? = nil
     var keychainService: String? = nil
     var keychainAccount: String? = nil
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        emoji: String,
+        colorHex: String,
+        hasOAuth: Bool = false,
+        hasCookie: Bool = false,
+        accountEmail: String? = nil,
+        cookie: String = "",
+        oauthToken: String? = nil,
+        keychainService: String? = nil,
+        keychainAccount: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.emoji = emoji
+        self.colorHex = colorHex
+        self.hasOAuth = hasOAuth
+        self.hasCookie = hasCookie
+        self.accountEmail = accountEmail
+        self.cookie = cookie
+        self.oauthToken = oauthToken
+        self.keychainService = keychainService
+        self.keychainAccount = keychainAccount
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, emoji, colorHex, hasOAuth, hasCookie, accountEmail
+        case cookie, oauthToken, keychainService, keychainAccount
+    }
+
+    // Every key but `name`/`emoji`/`colorHex` may be absent: an account saved
+    // by an older build lacks `hasOAuth`/`hasCookie`, and one saved by this
+    // build lacks whichever legacy fields it never had.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        name = try container.decode(String.self, forKey: .name)
+        emoji = try container.decode(String.self, forKey: .emoji)
+        colorHex = try container.decode(String.self, forKey: .colorHex)
+        hasOAuth = try container.decodeIfPresent(Bool.self, forKey: .hasOAuth) ?? false
+        hasCookie = try container.decodeIfPresent(Bool.self, forKey: .hasCookie) ?? false
+        accountEmail = try container.decodeIfPresent(String.self, forKey: .accountEmail)
+        cookie = try container.decodeIfPresent(String.self, forKey: .cookie) ?? ""
+        oauthToken = try container.decodeIfPresent(String.self, forKey: .oauthToken)
+        keychainService = try container.decodeIfPresent(String.self, forKey: .keychainService)
+        keychainAccount = try container.decodeIfPresent(String.self, forKey: .keychainAccount)
+    }
 
     static let palette: [String] = [
         "#3B82F6", // blue
@@ -751,8 +802,7 @@ struct Account: Codable, Identifiable, Equatable {
         Account(
             name: "Account \(index + 1)",
             emoji: emojiChoices[index % emojiChoices.count],
-            colorHex: palette[index % palette.count],
-            cookie: ""
+            colorHex: palette[index % palette.count]
         )
     }
 

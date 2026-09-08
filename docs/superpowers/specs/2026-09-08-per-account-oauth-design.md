@@ -161,12 +161,44 @@ Covered:
 - token JSON decode, including a response with no refresh token
 - keychain write, read, delete round trip
 
-## Verified live before the bulk of the work
+## Verified live, 2026-09-08
 
-Both need a real signed-in browser, so they are implemented and tested first.
+Answered by driving the real flow against a live account. Every item below is
+observed, not assumed.
 
-1. Whether the authorize page accepts an arbitrary loopback port. If it is
-   restricted, the loopback becomes fixed-port and the paste flow covers the
-   rest.
-2. Whether `/api/oauth/usage` accepts `user:profile user:inference`. If not,
-   scopes widen to match what the CLI requests.
+**Loopback redirects are rejected.** Sending Claude Code's own working
+authorize request with `redirect_uri` changed to `http://localhost:<port>/callback`
+is answered "Authorization failed / Invalid request format". Sign-in is
+paste-only: the authorize URL targets the paste-back callback, the page prints
+`code#state`, the user pastes it into the app.
+
+**`state` must be 32 random bytes** (43 base64url characters), matching what
+`claude setup-token` sends. A 16-byte state is rejected as an invalid request
+format, with nothing in the message pointing at the cause. This was the sole
+reason for three earlier failures that looked like scope and redirect
+problems.
+
+**An explicit User-Agent is required.** The token endpoint sits behind
+Cloudflare and answers an unrecognised agent with error 1010,
+`browser_signature_banned`. `claude-cli/2.1.263 (external, cli)` passes.
+Every request to the OAuth and usage endpoints sets it.
+
+**Scopes are `user:profile user:inference`.** `/api/oauth/usage` requires
+`user:profile`, and `/api/oauth/profile` requires `any_of(user:profile,
+user:office)`. A token holding `user:inference` alone gets 403 from both.
+
+**Refresh rotates the refresh token.** Confirmed against the live endpoint:
+the refresh response carries a refresh token that differs from the one sent.
+The single-flight guard is load-bearing.
+
+**The token response identifies the account.** It carries `account`
+(`uuid`, `email_address`) and `organization` inline, so an account is labelled
+at sign-in without a separate profile call. Access tokens last 28800 seconds,
+8 hours.
+
+Usage response shape, for reference:
+
+```json
+{"five_hour": {"utilization": 0.0, "resets_at": null, ...},
+ "seven_day": {"utilization": 17.0, "resets_at": "2026-09-08T11:59:59Z", ...}}
+```

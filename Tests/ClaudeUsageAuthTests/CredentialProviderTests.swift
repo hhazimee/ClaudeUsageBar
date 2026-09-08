@@ -257,4 +257,63 @@ struct CredentialProviderTests {
         #expect(store.load(id)?.oauth == nil)
         #expect(store.load(id)?.cookie == "sk-ant-sid-example")
     }
+
+    @Test func aNewSignInDuringARefreshIsNotOverwritten() async throws {
+        let store = makeStore(), id = UUID(), refresher = FakeRefresher()
+        defer { store.delete(id) }
+        refresher.holdUntilReleased = true
+        refresher.result = .success(try makeTokenResponse(accessToken: "renewed"))
+        try store.save(StoredCredential(oauth: OAuthTokens(
+            accessToken: "stale", refreshToken: "rt",
+            expiresAt: now.addingTimeInterval(60))), for: id)
+
+        let provider = CredentialProvider(store: store, client: refresher, now: { self.now })
+        async let outcome = await_(provider, id)
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        // Sign out and sign a different login in, both inside the refresh
+        // window. Testing only for a grant being present would let the old
+        // account's renewed token land on top of the new one.
+        provider.signOut(id)
+        try provider.mutate(id) {
+            $0.oauth = OAuthTokens(accessToken: "new", refreshToken: "rt-new")
+        }
+        refresher.release()
+
+        guard case .needsReauth = await outcome else {
+            Issue.record("expected the refresh to abandon its own result"); return
+        }
+        #expect(store.load(id)?.oauth?.accessToken == "new")
+        #expect(store.load(id)?.oauth?.refreshToken == "rt-new")
+    }
+
+    @Test func aRevokedGrantIsClearedAndNotRefreshedAgain() async throws {
+        let store = makeStore(), id = UUID(), refresher = FakeRefresher()
+        defer { store.delete(id) }
+        refresher.result = .failure(.server(status: 400, body: "invalid_grant"))
+        try store.save(StoredCredential(
+            oauth: OAuthTokens(accessToken: "stale", refreshToken: "rt",
+                               expiresAt: now.addingTimeInterval(60)),
+            cookie: "sk-ant-sid-example"), for: id)
+
+        let provider = CredentialProvider(store: store, client: refresher, now: { self.now })
+        #expect(await await_(provider, id) == .cookie("sk-ant-sid-example"))
+        #expect(store.load(id)?.oauth == nil)
+
+        // The cookie keeps feeding the account, and the dead grant is gone, so
+        // the next cycle does not fire another doomed refresh.
+        #expect(await await_(provider, id) == .cookie("sk-ant-sid-example"))
+        #expect(refresher.calls == 1)
+    }
+
+    @Test func deletingAnAccountRemovesEverythingItStored() throws {
+        let store = makeStore(), id = UUID()
+        defer { store.delete(id) }
+        try store.save(StoredCredential(oauth: OAuthTokens(accessToken: "at"),
+                                        cookie: "sk-ant-sid-example"), for: id)
+
+        let provider = CredentialProvider(store: store, client: FakeRefresher(), now: { self.now })
+        provider.delete(id)
+        #expect(store.load(id) == nil)
+    }
 }

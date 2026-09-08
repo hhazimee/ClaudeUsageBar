@@ -578,6 +578,10 @@ struct Account: Codable, Identifiable, Equatable {
     /// Email the account's grant resolved to, shown on its row.
     var accountEmail: String? = nil
 
+    /// Anthropic's own id for the signed-in login. Kept so a second account
+    /// cannot sign in to the login a first account already holds.
+    var accountUUID: String? = nil
+
     // Legacy fields. Decoded so accounts saved before the keychain move can be
     // migrated, then blanked. Nothing reads them after `migrateSecretsToKeychain`.
     var cookie: String = ""
@@ -593,6 +597,7 @@ struct Account: Codable, Identifiable, Equatable {
         hasOAuth: Bool = false,
         hasCookie: Bool = false,
         accountEmail: String? = nil,
+        accountUUID: String? = nil,
         cookie: String = "",
         oauthToken: String? = nil,
         keychainService: String? = nil,
@@ -605,6 +610,7 @@ struct Account: Codable, Identifiable, Equatable {
         self.hasOAuth = hasOAuth
         self.hasCookie = hasCookie
         self.accountEmail = accountEmail
+        self.accountUUID = accountUUID
         self.cookie = cookie
         self.oauthToken = oauthToken
         self.keychainService = keychainService
@@ -612,7 +618,7 @@ struct Account: Codable, Identifiable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, emoji, colorHex, hasOAuth, hasCookie, accountEmail
+        case id, name, emoji, colorHex, hasOAuth, hasCookie, accountEmail, accountUUID
         case cookie, oauthToken, keychainService, keychainAccount
     }
 
@@ -628,6 +634,7 @@ struct Account: Codable, Identifiable, Equatable {
         hasOAuth = try container.decodeIfPresent(Bool.self, forKey: .hasOAuth) ?? false
         hasCookie = try container.decodeIfPresent(Bool.self, forKey: .hasCookie) ?? false
         accountEmail = try container.decodeIfPresent(String.self, forKey: .accountEmail)
+        accountUUID = try container.decodeIfPresent(String.self, forKey: .accountUUID)
         cookie = try container.decodeIfPresent(String.self, forKey: .cookie) ?? ""
         oauthToken = try container.decodeIfPresent(String.self, forKey: .oauthToken)
         keychainService = try container.decodeIfPresent(String.self, forKey: .keychainService)
@@ -843,6 +850,11 @@ class AccountsController: ObservableObject {
         manager.notificationsEnabled = { [weak self] in self?.usageNotificationsEnabled ?? true }
         manager.onUsageChanged = { [weak self] in self?.refreshStatusBar() }
         manager.onAccountEdited = { [weak self] _ in self?.persist() }
+        manager.accountHolding = { [weak self] uuid in
+            self?.managers.first {
+                $0.account.id != account.id && $0.account.accountUUID == uuid
+            }?.account.displayName
+        }
         return manager
     }
 
@@ -857,6 +869,9 @@ class AccountsController: ObservableObject {
     func removeAccount(id: UUID) {
         // Keep at least one account so there is always somewhere to paste a cookie.
         guard managers.count > 1, let index = managers.firstIndex(where: { $0.account.id == id }) else { return }
+        // Before the row goes, or the tokens and cookie sit in the keychain
+        // with nothing left that can reach them.
+        credentials.delete(id)
         UserDefaults.standard.removeObject(forKey: "last_notified_threshold_\(id.uuidString)")
         managers.remove(at: index)
         persist()
@@ -1015,6 +1030,10 @@ class UsageManager: ObservableObject {
     /// read here so one toggle governs every account.
     var notificationsEnabled: () -> Bool = { true }
 
+    /// Name of the other account already signed in to this login, if any. Set
+    /// by the controller, which is the only object that sees every account.
+    var accountHolding: ((String) -> String?)?
+
     private var lastNotifiedThreshold: Int = 0
 
     /// Notification state is per account, otherwise two accounts overwrite each
@@ -1061,6 +1080,7 @@ class UsageManager: ObservableObject {
     }
 
     private func reportReauthNeeded() {
+        guard notificationsEnabled() else { return }
         guard !reauthNotified else { return }
         reauthNotified = true
         Notifier.send(title: "\(account.displayName) needs a new sign-in",
@@ -1110,15 +1130,27 @@ class UsageManager: ObservableObject {
             case .failure(let error):
                 DispatchQueue.main.async { completion("Sign-in failed: \(error)") }
             case .success(let response):
-                do {
-                    try self.credentials.mutate(self.account.id) { $0.oauth = response.tokens() }
-                } catch {
-                    DispatchQueue.main.async { completion("Could not save the sign-in: \(error)") }
-                    return
-                }
+                // On the main thread throughout: the account list this checks
+                // against belongs to the controller, and the row it stamps is
+                // published state.
                 DispatchQueue.main.async {
+                    // A sign-in from a normal browser window re-authorises
+                    // whoever is already logged in, which would leave two rows
+                    // on one login reporting the same numbers.
+                    if let uuid = response.account?.uuid,
+                       let holder = self.accountHolding?(uuid) {
+                        completion("That login is already used by \(holder).")
+                        return
+                    }
+                    do {
+                        try self.credentials.mutate(self.account.id) { $0.oauth = response.tokens() }
+                    } catch {
+                        completion("Could not save the sign-in: \(error)")
+                        return
+                    }
                     self.account.hasOAuth = true
                     self.account.accountEmail = response.accountEmail
+                    self.account.accountUUID = response.account?.uuid
                     self.needsReauth = false
                     self.reauthNotified = false
                     self.usingCookieFallback = false
@@ -1143,6 +1175,7 @@ class UsageManager: ObservableObject {
         credentials.signOut(account.id)
         account.hasOAuth = false
         account.accountEmail = nil
+        account.accountUUID = nil
         needsReauth = false
         reauthNotified = false
         usingCookieFallback = false

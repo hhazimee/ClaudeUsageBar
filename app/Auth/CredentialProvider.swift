@@ -123,6 +123,12 @@ public final class CredentialProvider {
         }
     }
 
+    /// Removes everything stored for an account. Called when the account is
+    /// deleted, so its secrets do not outlive the row that owned them.
+    public func delete(_ id: UUID) {
+        queue.sync { store.delete(id) }
+    }
+
     private func apply(_ result: Result<TokenResponse, OAuthError>,
                        previousRefreshToken: String,
                        id: UUID) -> CredentialOutcome {
@@ -134,7 +140,10 @@ public final class CredentialProvider {
 
         switch result {
         case .success(let response):
-            guard current.oauth != nil else {
+            // Compare the grant, not just its presence: a sign-out followed by
+            // a new sign-in inside the refresh window would otherwise have the
+            // old account's renewed token written over the new grant.
+            guard current.oauth?.refreshToken == previousRefreshToken else {
                 return fallback(current, reason: "signed out during refresh")
             }
             var renewed = response.tokens(now: now())
@@ -155,6 +164,19 @@ public final class CredentialProvider {
             return .token(renewed.accessToken)
 
         case .failure(let error) where error.isAuthFailure:
+            // The grant is revoked. Drop it, keeping the cookie, so every later
+            // cycle does not fire another doomed refresh. Written through the
+            // store directly: this already runs on the queue, and `mutate`
+            // would deadlock on it.
+            var cleared = current
+            cleared.oauth = nil
+            if cleared.isEmpty {
+                store.delete(id)
+            } else {
+                try? store.save(cleared, for: id)
+            }
+            // Reported from the pre-clear credential, so an account with no
+            // cookie still asks for a new sign-in rather than reading as blank.
             return fallback(current, reason: "sign-in expired")
 
         case .failure(let error):

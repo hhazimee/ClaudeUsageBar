@@ -2,6 +2,8 @@ import SwiftUI
 import AppKit
 import WebKit
 import Carbon
+import CryptoKit
+import Security
 import ServiceManagement
 import UserNotifications
 
@@ -540,6 +542,159 @@ enum Notifier {
     }
 }
 
+// MARK: - Claude Code credentials
+
+/// Reads the OAuth tokens Claude Code stores in the login keychain.
+///
+/// Strictly read-only. The app never refreshes a token and never writes back,
+/// because refreshing rotates the refresh token and would sign Claude Code
+/// out. An expired token is simply not used: the account falls back to its
+/// cookie until Claude Code next runs, refreshes, and writes a new one.
+enum ClaudeCodeKeychain {
+    /// Every keychain item Claude Code writes is named with this prefix. The
+    /// active login is the bare name; the suffixed ones are other accounts it
+    /// has held.
+    static let servicePrefix = "Claude Code-credentials"
+
+    struct Credential {
+        let service: String
+        let account: String
+        let accessToken: String
+        let expiresAt: Date?
+        let subscriptionType: String?
+
+        var isExpired: Bool {
+            guard let expiresAt = expiresAt else { return false }
+            return expiresAt <= Date()
+        }
+
+        /// Identifies the token without carrying it around. Used to notice
+        /// that the stored credential changed since it was last verified.
+        var tokenHash: String {
+            ClaudeCodeKeychain.hash(accessToken)
+        }
+    }
+
+    static func hash(_ value: String) -> String {
+        let digest = SHA256.hash(data: Data(value.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined().prefix(16).description
+    }
+
+    /// How many items we are willing to open before giving up.
+    ///
+    /// Reading an item's data is what triggers the access prompt, and there
+    /// can be a dozen of these items from past logins. Claude Code holds one
+    /// login at a time, so opening a few in the right order finds it, and the
+    /// cap stops a failed search turning into a wall of dialogs.
+    private static let maxReads = 3
+
+    /// The Claude Code login currently in the keychain, if it can be read.
+    ///
+    /// Listing item names does not prompt; only reading their contents does.
+    /// So the names are listed first, ordered by how likely each is to be the
+    /// live login, and only those are opened.
+    static func discover() -> [Credential] {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecReturnAttributes as String: true
+        ]
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let items = result as? [[String: Any]] else {
+            if status != errSecItemNotFound {
+                NSLog("🔑 Keychain search failed (OSStatus \(status))")
+            }
+            return []
+        }
+
+        let candidates = items.compactMap { item -> (service: String, account: String)? in
+            guard let service = item[kSecAttrService as String] as? String,
+                  service.hasPrefix(servicePrefix) else { return nil }
+            return (service, item[kSecAttrAccount as String] as? String ?? "")
+        }
+        .sorted(by: priority)
+
+        NSLog("🔑 \(candidates.count) Claude Code keychain item(s), opening up to \(maxReads)")
+
+        var found: [Credential] = []
+        for candidate in candidates.prefix(maxReads) {
+            guard let credential = read(service: candidate.service, account: candidate.account) else { continue }
+            found.append(credential)
+            // The live login is enough. Anything older is a past sign-in that
+            // expired months ago and is not worth another prompt.
+            if !credential.isExpired { break }
+        }
+        return found
+    }
+
+    /// Orders items by how likely each is to hold the current login: the
+    /// unsuffixed name is the one Claude Code writes on sign-in, and the
+    /// account attribute is the local username.
+    private static func priority(_ a: (service: String, account: String),
+                                 _ b: (service: String, account: String)) -> Bool {
+        func rank(_ item: (service: String, account: String)) -> Int {
+            var score = 0
+            if item.service == servicePrefix { score -= 2 }
+            if item.account == NSUserName() { score -= 1 }
+            return score
+        }
+        let (ra, rb) = (rank(a), rank(b))
+        return ra == rb ? a.service < b.service : ra < rb
+    }
+
+    /// Re-reads one item. Called on every fetch so a refresh Claude Code wrote
+    /// a minute ago is picked up without restarting the app.
+    static func read(service: String, account: String) -> Credential? {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecReturnAttributes as String: true,
+            kSecReturnData as String: true
+        ]
+        if !account.isEmpty {
+            query[kSecAttrAccount as String] = account
+        }
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess,
+              let item = result as? [String: Any],
+              let data = item[kSecValueData as String] as? Data else {
+            if status != errSecItemNotFound {
+                NSLog("🔑 Could not read '\(service)' (OSStatus \(status))")
+            }
+            return nil
+        }
+        return parse(data, service: service, account: account)
+    }
+
+    /// Pulls the claude.ai login out of a credentials blob. Items that hold
+    /// only MCP server logins return nil.
+    private static func parse(_ data: Data, service: String, account: String) -> Credential? {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = json["claudeAiOauth"] as? [String: Any],
+              let token = oauth["accessToken"] as? String,
+              !token.isEmpty else { return nil }
+
+        // expiresAt is milliseconds since the epoch.
+        var expiresAt: Date?
+        if let millis = oauth["expiresAt"] as? Double {
+            expiresAt = Date(timeIntervalSince1970: millis / 1000)
+        }
+
+        return Credential(
+            service: service,
+            account: account,
+            accessToken: token,
+            expiresAt: expiresAt,
+            subscriptionType: oauth["subscriptionType"] as? String
+        )
+    }
+}
+
 // MARK: - Accounts
 
 /// One Claude login the app monitors.
@@ -553,6 +708,32 @@ struct Account: Codable, Identifiable, Equatable {
     var emoji: String
     var colorHex: String
     var cookie: String
+
+    // MARK: OAuth
+    //
+    // Optional so accounts saved before OAuth support decode unchanged: a
+    // synthesised decoder treats a missing key as nil only for optionals.
+
+    /// A long-lived token pasted from `claude setup-token`.
+    var oauthToken: String? = nil
+
+    /// Keychain service name of a Claude Code login this account reads, e.g.
+    /// "Claude Code-credentials". Set when the account is bound to whichever
+    /// account Claude Code itself is signed into.
+    var keychainService: String? = nil
+
+    /// Keychain account attribute for the item above. Several items share a
+    /// service name, so the pair is needed to address one.
+    var keychainAccount: String? = nil
+
+    /// Email the bound credential last resolved to, used to notice that Claude
+    /// Code has been signed into a different account since the binding.
+    var accountEmail: String? = nil
+
+    /// Hash of the access token the email above was verified against. The
+    /// profile is re-checked only when the stored token changes, which happens
+    /// on a refresh or an account switch, not on every fetch.
+    var verifiedTokenHash: String? = nil
 
     static let palette: [String] = [
         "#3B82F6", // blue
@@ -889,6 +1070,139 @@ class UsageManager: ObservableObject {
     /// The cookie for this account.
     private var sessionCookie: String { account.cookie }
 
+    // MARK: - Authentication
+
+    /// How this account authenticates, in the order the app prefers.
+    ///
+    /// OAuth is preferred because it is account-scoped (no org ID lookup, so
+    /// none of that can fail), it is not behind the bot challenge that fronts
+    /// claude.ai, and a Claude Code login refreshes itself. The cookie stays
+    /// as the fallback for accounts Claude Code is not signed into.
+    enum AuthSource: Equatable {
+        /// A Claude Code login read live from the keychain.
+        case keychain(ClaudeCodeKeychain.Credential)
+        /// A long-lived token pasted from `claude setup-token`.
+        case token(String)
+        /// The pasted claude.ai session cookie.
+        case cookie
+        /// Nothing configured, or the only thing configured cannot be used.
+        case none
+
+        static func == (lhs: AuthSource, rhs: AuthSource) -> Bool {
+            switch (lhs, rhs) {
+            case let (.keychain(a), .keychain(b)): return a.accessToken == b.accessToken
+            case let (.token(a), .token(b)):       return a == b
+            case (.cookie, .cookie), (.none, .none): return true
+            default: return false
+            }
+        }
+
+        var bearerToken: String? {
+            switch self {
+            case .keychain(let credential): return credential.accessToken
+            case .token(let token):         return token
+            case .cookie, .none:            return nil
+            }
+        }
+    }
+
+    /// Resolves the credential to use right now.
+    ///
+    /// The keychain is re-read on every call rather than cached, so a token
+    /// Claude Code refreshed a moment ago is used immediately. An expired one
+    /// is skipped rather than refreshed: refreshing rotates the refresh token
+    /// and would sign Claude Code out.
+    var authSource: AuthSource {
+        if let service = account.keychainService,
+           let credential = ClaudeCodeKeychain.read(service: service, account: account.keychainAccount ?? "") {
+            if !credential.isExpired {
+                return .keychain(credential)
+            }
+            NSLog("🔑 '\(account.displayName)': Claude Code token expired, falling back")
+        }
+
+        if let token = account.oauthToken, !token.isEmpty {
+            return .token(token)
+        }
+
+        return sessionCookie.isEmpty ? .none : .cookie
+    }
+
+    /// A short description of the live credential, for the popup.
+    var authSourceLabel: String {
+        switch authSource {
+        case .keychain:
+            let email = account.accountEmail.map { " (\($0))" } ?? ""
+            return "Claude Code login\(email)"
+        case .token:  return "Setup token"
+        case .cookie: return "Session cookie"
+        case .none:   return "Not configured"
+        }
+    }
+
+    /// True when anything at all is configured, whether or not it still works.
+    var hasCredential: Bool {
+        !sessionCookie.isEmpty
+            || !(account.oauthToken ?? "").isEmpty
+            || account.keychainService != nil
+    }
+
+    /// Binds this account to a Claude Code login. Returns nil on success, or a
+    /// message explaining why it cannot be used.
+    @discardableResult
+    func bindKeychainLogin(_ credential: ClaudeCodeKeychain.Credential, email: String?) -> String? {
+        guard !credential.isExpired else {
+            return "That Claude Code login has expired. Run Claude Code once to refresh it."
+        }
+        account.keychainService = credential.service
+        account.keychainAccount = credential.account
+        account.accountEmail = email
+        account.verifiedTokenHash = credential.tokenHash
+        onAccountEdited?(account)
+        NSLog("🔑 '\(account.displayName)' bound to \(credential.service)\(email.map { " (\($0))" } ?? "")")
+        return nil
+    }
+
+    func unbindKeychainLogin() {
+        account.keychainService = nil
+        account.keychainAccount = nil
+        account.verifiedTokenHash = nil
+        onAccountEdited?(account)
+    }
+
+    /// Saves a token pasted from `claude setup-token`. Returns nil on success,
+    /// or a message explaining why the paste cannot work.
+    @discardableResult
+    func saveOAuthToken(_ raw: String) -> String? {
+        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .joined()
+
+        guard !token.isEmpty else { return "Token field is empty" }
+
+        // `claude setup-token` prints an sk-ant-oat01 token. A session cookie
+        // (sk-ant-sid02) pasted here would 401 with nothing explaining why.
+        guard token.hasPrefix("sk-ant-oat") else {
+            if token.hasPrefix("sk-ant-sid") {
+                return "That is a session cookie, not a token. Paste it in the cookie field instead."
+            }
+            return "That does not look like a setup token. It should start with sk-ant-oat."
+        }
+
+        account.oauthToken = token
+        account.accountEmail = nil
+        account.verifiedTokenHash = nil
+        onAccountEdited?(account)
+        NSLog("🔑 Setup token saved for '\(account.displayName)' (\(token.count) chars)")
+        return nil
+    }
+
+    func clearOAuthToken() {
+        account.oauthToken = nil
+        onAccountEdited?(account)
+    }
+
     var sessionPercent: Int {
         guard sessionLimit > 0 else { return 0 }
         return Int((Double(sessionUsage) / Double(sessionLimit)) * 100)
@@ -1218,9 +1532,13 @@ class UsageManager: ObservableObject {
     }
 
     func fetchUsage() {
-        guard !sessionCookie.isEmpty else {
+        let source = authSource
+
+        guard source != .none else {
             DispatchQueue.main.async {
-                self.errorMessage = "Session cookie not set"
+                self.errorMessage = self.hasCredential
+                    ? "Claude Code login expired and no cookie set"
+                    : "No credential set"
                 self.updateStatusBar()
             }
             return
@@ -1228,6 +1546,176 @@ class UsageManager: ObservableObject {
 
         isLoading = true
         errorMessage = nil
+
+        if let token = source.bearerToken {
+            fetchUsageViaOAuth(token, source: source)
+            return
+        }
+
+        fetchUsageViaCookie()
+    }
+
+    // MARK: - OAuth fetch
+
+    /// Base for the OAuth endpoints. These are account-scoped, so unlike the
+    /// claude.ai ones they need no organisation ID.
+    private static let oauthHost = "https://api.anthropic.com"
+
+    private func makeOAuthRequest(_ path: String, token: String) -> URLRequest? {
+        guard let url = URL(string: Self.oauthHost + path) else { return nil }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("ClaudeUsageMulti (macOS menu bar)", forHTTPHeaderField: "User-Agent")
+        return request
+    }
+
+    private func fetchUsageViaOAuth(_ token: String, source: AuthSource) {
+        guard let request = makeOAuthRequest("/api/oauth/usage", token: token) else {
+            DispatchQueue.main.async {
+                self.errorMessage = "Invalid usage URL"
+                self.isLoading = false
+            }
+            return
+        }
+
+        NSLog("🔍 Fetching usage via OAuth for '\(account.displayName)'")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                self.isLoading = false
+
+                if let error = error {
+                    NSLog("❌ OAuth usage network error: \(error.localizedDescription)")
+                    self.errorMessage = "Network error"
+                    self.updateStatusBar()
+                    return
+                }
+
+                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                NSLog("📡 OAuth usage status: \(status)")
+
+                // 401 means the token is dead: expired, or revoked by a
+                // sign-out. Drop to the cookie if there is one, rather than
+                // showing an error for an account that can still be read.
+                if status == 401 || status == 403 {
+                    if !self.sessionCookie.isEmpty {
+                        NSLog("↩️ Token rejected (HTTP \(status)), falling back to cookie")
+                        self.isLoading = true
+                        self.fetchUsageViaCookie()
+                        return
+                    }
+                    self.errorMessage = self.tokenRejectedMessage(for: source, status: status)
+                    self.updateStatusBar()
+                    return
+                }
+
+                guard status == 200, let data = data else {
+                    self.errorMessage = "HTTP \(status)"
+                    self.updateStatusBar()
+                    return
+                }
+
+                self.parseUsageData(data)
+                self.updateStatusBar()
+            }
+
+            self.verifyIdentityIfNeeded(token, source: source)
+        }.resume()
+    }
+
+    private func tokenRejectedMessage(for source: AuthSource, status: Int) -> String {
+        switch source {
+        case .keychain:
+            return "Claude Code login rejected (HTTP \(status)) - sign in again with claude auth login"
+        case .token:
+            return "Token rejected (HTTP \(status)) - run claude setup-token for a new one"
+        default:
+            return "Credential rejected (HTTP \(status))"
+        }
+    }
+
+    /// Confirms whose account a credential belongs to.
+    ///
+    /// Claude Code holds one login at a time, so a bound account would
+    /// silently start reporting somebody else's numbers after `claude auth
+    /// login`. The check runs only when the stored token differs from the one
+    /// last verified, which is on a refresh or a switch, not on every fetch.
+    private func verifyIdentityIfNeeded(_ token: String, source: AuthSource) {
+        let hash = ClaudeCodeKeychain.hash(token)
+        guard account.verifiedTokenHash != hash else { return }
+
+        fetchOAuthProfile(token) { [weak self] email, _ in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                guard let email = email else { return }
+
+                let previous = self.account.accountEmail
+                self.account.verifiedTokenHash = hash
+                self.account.accountEmail = email
+                self.onAccountEdited?(self.account)
+
+                guard case .keychain = source, let previous = previous, previous != email else {
+                    NSLog("👤 '\(self.account.displayName)' verified as \(email)")
+                    return
+                }
+
+                // Claude Code is signed into a different account than the one
+                // this was bound to. Stop reading it: wrong numbers are worse
+                // than no numbers.
+                NSLog("⚠️ '\(self.account.displayName)' was bound to \(previous) but Claude Code now holds \(email). Unbinding.")
+                self.unbindKeychainLogin()
+                self.account.accountEmail = previous
+                self.onAccountEdited?(self.account)
+                self.errorMessage = "Claude Code is now signed in as \(email), not \(previous)"
+                self.fetchUsage()
+            }
+        }
+    }
+
+    /// Resolves the email and organisation a token belongs to.
+    func fetchOAuthProfile(_ token: String, completion: @escaping (String?, String?) -> Void) {
+        guard let request = makeOAuthRequest("/api/oauth/profile", token: token) else {
+            completion(nil, "Invalid profile URL")
+            return
+        }
+
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                completion(nil, "Network error: \(error.localizedDescription)")
+                return
+            }
+
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == 200, let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                completion(nil, status == 401 || status == 403
+                    ? "Credential rejected (HTTP \(status))"
+                    : "Profile lookup failed (HTTP \(status))")
+                return
+            }
+
+            guard let email = (json["account"] as? [String: Any])?["email"] as? String else {
+                completion(nil, "No email in profile response")
+                return
+            }
+            completion(email, nil)
+        }.resume()
+    }
+
+    // MARK: - Cookie fetch
+
+    private func fetchUsageViaCookie() {
+        guard !sessionCookie.isEmpty else {
+            DispatchQueue.main.async {
+                self.errorMessage = "Session cookie not set"
+                self.isLoading = false
+                self.updateStatusBar()
+            }
+            return
+        }
 
         // Extract org ID from cookie
         fetchOrganizationId { [weak self] orgId, failureReason in
@@ -1448,7 +1936,32 @@ class UsageManager: ObservableObject {
                 }
             }
 
-            // (Prepaid usage credits are fetched separately from /prepaid/credits.)
+            // The OAuth endpoint carries extra usage inline, where the
+            // claude.ai one needs a second call to /overage_spend_limit.
+            // Absent on the cookie payload, so fetchExtraUsage still runs there.
+            if let extra = json["extra_usage"] as? [String: Any] {
+                // Amounts are scaled by decimal_places; the UI works in minor
+                // units, which is 2 places.
+                let places = (extra["decimal_places"] as? Int) ?? 2
+                let toMinor: (Any?) -> Int = { value in
+                    let amount: Double
+                    if let int = value as? Int { amount = Double(int) }
+                    else if let double = value as? Double { amount = double }
+                    else { return 0 }
+                    return Int((amount * pow(10, Double(2 - places))).rounded())
+                }
+
+                extraSpentMinor = toMinor(extra["used_credits"])
+                extraLimitMinor = toMinor(extra["monthly_limit"])
+                if let currency = extra["currency"] as? String { creditCurrency = currency }
+                hasCreditUsage = extraSpentMinor > 0
+                if extraSpentMinor > 0 || extraLimitMinor > 0 {
+                    NSLog("💳 Extra usage: \(extraSpentMinor)/\(extraLimitMinor) \(creditCurrency)")
+                }
+            }
+
+            // (On the cookie path, prepaid credits are fetched separately from
+            // /prepaid/credits. The OAuth endpoint has no equivalent.)
 
             // Log what we found
             NSLog("✅ Parsed: Session \(sessionUsage)%, Weekly \(weeklyUsage)%\(hasWeeklySonnet ? ", Weekly Sonnet \(weeklySonnetUsage)%" : "")\(hasWeeklyFable ? ", Weekly Fable \(weeklyFableUsage)%" : "")")
@@ -2766,8 +3279,247 @@ struct AccountUsageSection: View {
     @State private var sessionCookieInput: String = ""
     @State private var showingCookieInput: Bool = false
     @State private var hasSavedCookie: Bool = false
+    @State private var tokenInput: String = ""
+
+    /// Claude Code logins found in the keychain, with the email each resolves
+    /// to once looked up. Populated when the sign-in section is opened.
+    @State private var discoveredLogins: [DiscoveredLogin] = []
+    @State private var isDiscovering: Bool = false
+
+    /// A keychain credential plus whatever the app has learned about it.
+    struct DiscoveredLogin: Identifiable {
+        let credential: ClaudeCodeKeychain.Credential
+        var email: String?
+        var problem: String?
+
+        var id: String { credential.service + "|" + credential.account }
+    }
 
     private var account: Account { manager.account }
+
+    // MARK: - Sign-in
+
+    /// Binding to the login Claude Code already holds. Nothing to paste, and
+    /// it keeps working through refreshes because the keychain is re-read on
+    /// every fetch.
+    @ViewBuilder
+    private var claudeCodeLoginSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Claude Code login")
+                .font(.caption)
+                .fontWeight(.semibold)
+
+            if let service = account.keychainService {
+                HStack(spacing: 6) {
+                    Text(account.accountEmail ?? service)
+                        .font(.caption2)
+                        .foregroundColor(Color.secondaryText)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button("Unbind") {
+                        manager.unbindKeychainLogin()
+                        manager.fetchUsage()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            } else if isDiscovering {
+                Text("Reading keychain...")
+                    .font(.caption2)
+                    .foregroundColor(Color.secondaryText)
+            } else if discoveredLogins.isEmpty {
+                Text("No Claude Code login found. Run `claude auth login` in Terminal, then reopen this.")
+                    .font(.caption2)
+                    .foregroundColor(Color.secondaryText)
+            } else {
+                ForEach(discoveredLogins) { login in
+                    HStack(spacing: 6) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(login.email ?? login.credential.service)
+                                .font(.caption2)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            if let problem = login.problem {
+                                Text(problem)
+                                    .font(.caption2)
+                                    .foregroundColor(Color.secondaryText)
+                                    .opacity(0.8)
+                            }
+                        }
+                        Spacer()
+                        Button("Use") {
+                            if let problem = manager.bindKeychainLogin(login.credential, email: login.email) {
+                                manager.errorMessage = problem
+                                return
+                            }
+                            manager.fetchUsage()
+                            manager.errorMessage = "Signed in, fetching..."
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(login.credential.isExpired)
+                    }
+                }
+            }
+        }
+    }
+
+    /// A long-lived token, for accounts Claude Code is not signed into.
+    @ViewBuilder
+    private var setupTokenSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Setup token")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Spacer()
+                if !(account.oauthToken ?? "").isEmpty {
+                    Button("Clear") {
+                        tokenInput = ""
+                        manager.clearOAuthToken()
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption2)
+                }
+            }
+
+            Text("Run `claude setup-token` in Terminal and paste what it prints. Lasts about a year.")
+                .font(.caption2)
+                .foregroundColor(Color.secondaryText)
+
+            PasteableTextField(
+                text: $tokenInput,
+                placeholder: (account.oauthToken ?? "").isEmpty
+                    ? "sk-ant-oat..."
+                    : "A token is saved. Paste a new one to replace it."
+            )
+            .frame(height: 40)
+            .cornerRadius(4)
+
+            Button("Save Token & Fetch") {
+                if let problem = manager.saveOAuthToken(tokenInput) {
+                    manager.errorMessage = problem
+                    return
+                }
+                tokenInput = ""
+                manager.fetchUsage()
+                manager.errorMessage = "Token saved, fetching..."
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        }
+    }
+
+    /// The original cookie route, kept as the fallback when no token works.
+    @ViewBuilder
+    private var cookieSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Session cookie")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                Spacer()
+                Button(action: {
+                    NSWorkspace.shared.open(URL(string: "https://github.com/Artzainnn/ClaudeUsageBar/blob/main/setup-guide.png")!)
+                }) {
+                    Text("View tutorial →")
+                        .font(.caption2)
+                        .foregroundColor(.blue)
+                }
+                .buttonStyle(.borderless)
+            }
+
+            VStack(alignment: .leading, spacing: 2) {
+                // The Network tab route told people to copy the Cookie
+                // header, and they reliably stopped at the first semicolon
+                // and got anthropic-device-id instead. The Application tab
+                // gives one unambiguous value.
+                Text("1. Open claude.ai and sign in")
+                Text("2. Press F12 (or Cmd+Option+I)")
+                Text("3. Go to Application > Cookies > claude.ai")
+                Text("4. Click the row named 'sessionKey'")
+                Text("5. Copy its whole Value (starts sk-ant-sid)")
+            }
+            .font(.caption2)
+            .foregroundColor(Color.secondaryText)
+
+            PasteableTextField(
+                text: $sessionCookieInput,
+                placeholder: hasSavedCookie
+                    ? "A cookie is saved. Paste a new one to replace it."
+                    : "Paste cookie here..."
+            )
+            .frame(height: 40)
+            .cornerRadius(4)
+
+            HStack(spacing: 8) {
+                Button("Save Cookie & Fetch") {
+                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
+                    if sessionCookieInput.isEmpty {
+                        manager.errorMessage = "Cookie field is empty!"
+                    } else {
+                        if let problem = manager.saveSessionCookie(sessionCookieInput) {
+                            manager.errorMessage = problem
+                            return
+                        }
+                        hasSavedCookie = true
+                        sessionCookieInput = ""
+                        manager.fetchUsage()
+                        manager.errorMessage = "Cookie saved, fetching..."
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+
+                if hasSavedCookie {
+                    Button("Clear Cookie") {
+                        sessionCookieInput = ""
+                        hasSavedCookie = false
+                        manager.clearSessionCookie()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+        }
+    }
+
+    /// Lists the Claude Code logins in the keychain and resolves each one's
+    /// email, so the user picks an account rather than an opaque item name.
+    private func discoverClaudeCodeLogins() {
+        guard account.keychainService == nil, !isDiscovering else { return }
+        isDiscovering = true
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let credentials = ClaudeCodeKeychain.discover()
+
+            DispatchQueue.main.async {
+                discoveredLogins = credentials.map { credential in
+                    DiscoveredLogin(
+                        credential: credential,
+                        email: nil,
+                        problem: credential.isExpired
+                            ? "Expired. Run Claude Code once to refresh it."
+                            : nil
+                    )
+                }
+                isDiscovering = false
+
+                // Name each login. Without this they read as
+                // "Claude Code-credentials-a4244b51", which picks nothing.
+                for login in discoveredLogins where !login.credential.isExpired {
+                    manager.fetchOAuthProfile(login.credential.accessToken) { email, problem in
+                        DispatchQueue.main.async {
+                            guard let index = discoveredLogins.firstIndex(where: { $0.id == login.id }) else { return }
+                            discoveredLogins[index].email = email
+                            if email == nil { discoveredLogins[index].problem = problem }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -2968,89 +3720,28 @@ struct AccountUsageSection: View {
                 }
             }
             }
-            Button(showingCookieInput ? "Hide Cookie" : "Set Session Cookie") {
+            // Which credential is actually being used, so a silent fallback
+            // from a dead token to a cookie is visible rather than mysterious.
+            if manager.hasCredential {
+                Text(manager.authSourceLabel)
+                    .font(.caption2)
+                    .foregroundColor(Color.secondaryText)
+                    .opacity(0.7)
+            }
+
+            Button(showingCookieInput ? "Hide Sign-in" : "Set Sign-in") {
                 showingCookieInput.toggle()
             }
             .buttonStyle(.borderless)
             .font(.caption)
 
             if showingCookieInput {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("How to get your session cookie:")
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                        Spacer()
-                        Button(action: {
-                            NSWorkspace.shared.open(URL(string: "https://github.com/Artzainnn/ClaudeUsageBar/blob/main/setup-guide.png")!)
-                        }) {
-                            Text("View tutorial →")
-                                .font(.caption2)
-                                .foregroundColor(.blue)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        // The Network tab route told people to copy the Cookie
-                        // header, and they reliably stopped at the first
-                        // semicolon and got anthropic-device-id instead. The
-                        // Application tab gives one unambiguous value.
-                        Text("1. Open claude.ai and sign in")
-                        Text("2. Press F12 (or Cmd+Option+I)")
-                        Text("3. Go to Application > Cookies > claude.ai")
-                        Text("4. Click the row named 'sessionKey'")
-                        Text("5. Copy its whole Value\n   (starts with sk-ant-sid01-)")
-                        Text("6. Paste it below")
-                    }
-                    .font(.caption2)
-                    .foregroundColor(Color.secondaryText)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Paste your sessionKey:")
-                            .font(.caption2)
-                            .foregroundColor(Color.secondaryText)
-                        VStack(spacing: 4) {
-                            PasteableTextField(
-                                text: $sessionCookieInput,
-                                placeholder: hasSavedCookie
-                                    ? "A cookie is saved. Paste a new one to replace it."
-                                    : "Paste cookie here..."
-                            )
-                                .frame(height: 60)
-                                .cornerRadius(4)
-
-                            HStack(spacing: 8) {
-                                Button("Save Cookie & Fetch") {
-                                    NSLog("ClaudeUsage: Save clicked, input length: \(sessionCookieInput.count)")
-                                    if sessionCookieInput.isEmpty {
-                                        manager.errorMessage = "Cookie field is empty!"
-                                    } else {
-                                        if let problem = manager.saveSessionCookie(sessionCookieInput) {
-                                            manager.errorMessage = problem
-                                            return
-                                        }
-                                        hasSavedCookie = true
-                                        sessionCookieInput = ""
-                                        manager.fetchUsage()
-                                        manager.errorMessage = "Cookie saved, fetching..."
-                                    }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-
-                                if manager.hasFetchedData {
-                                    Button("Clear Cookie") {
-                                        sessionCookieInput = ""
-                                        hasSavedCookie = false
-                                        manager.clearSessionCookie()
-                                    }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
-                                }
-                            }
-                        }
-                    }
+                VStack(alignment: .leading, spacing: 12) {
+                    claudeCodeLoginSection
+                    Divider()
+                    setupTokenSection
+                    Divider()
+                    cookieSection
                 }
                 .padding(8)
                 .background(Color.secondary.opacity(0.1))
@@ -3061,7 +3752,13 @@ struct AccountUsageSection: View {
         }
         .onAppear {
             sessionCookieInput = ""
+            tokenInput = ""
             hasSavedCookie = !account.cookie.isEmpty
+        }
+        .onChange(of: showingCookieInput) { isOpen in
+            // Reading the keychain can prompt, so only do it when the user
+            // has actually asked to change the sign-in.
+            if isOpen { discoverClaudeCodeLogins() }
         }
     }
 

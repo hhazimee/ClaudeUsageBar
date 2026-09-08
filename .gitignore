@@ -12,6 +12,7 @@
 # Build artifacts
 app/build/
 App/build/
+.build/
 *.dmg
 *.zip
 app/temp.dmg

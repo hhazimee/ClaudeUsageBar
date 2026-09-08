@@ -850,9 +850,19 @@ class AccountsController: ObservableObject {
         manager.notificationsEnabled = { [weak self] in self?.usageNotificationsEnabled ?? true }
         manager.onUsageChanged = { [weak self] in self?.refreshStatusBar() }
         manager.onAccountEdited = { [weak self] _ in self?.persist() }
-        manager.accountHolding = { [weak self] uuid in
-            self?.managers.first {
-                $0.account.id != account.id && $0.account.accountUUID == uuid
+        manager.accountHolding = { [weak self] uuid, email in
+            let normalizedEmail = email?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return self?.managers.first { other in
+                guard other.account.id != account.id else { return false }
+                if let uuid, let otherUUID = other.account.accountUUID, uuid == otherUUID {
+                    return true
+                }
+                if let normalizedEmail, !normalizedEmail.isEmpty,
+                   let otherEmail = other.account.accountEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+                   normalizedEmail == otherEmail {
+                    return true
+                }
+                return false
             }?.account.displayName
         }
         return manager
@@ -1032,7 +1042,8 @@ class UsageManager: ObservableObject {
 
     /// Name of the other account already signed in to this login, if any. Set
     /// by the controller, which is the only object that sees every account.
-    var accountHolding: ((String) -> String?)?
+    /// Takes the uuid and email from the token response; either may be nil.
+    var accountHolding: ((String?, String?) -> String?)?
 
     private var lastNotifiedThreshold: Int = 0
 
@@ -1136,9 +1147,10 @@ class UsageManager: ObservableObject {
                 DispatchQueue.main.async {
                     // A sign-in from a normal browser window re-authorises
                     // whoever is already logged in, which would leave two rows
-                    // on one login reporting the same numbers.
-                    if let uuid = response.account?.uuid,
-                       let holder = self.accountHolding?(uuid) {
+                    // on one login reporting the same numbers. Accounts signed
+                    // in before accountUUID existed have no uuid to compare, so
+                    // this also falls back to email.
+                    if let holder = self.accountHolding?(response.account?.uuid, response.accountEmail) {
                         completion("That login is already used by \(holder).")
                         return
                     }

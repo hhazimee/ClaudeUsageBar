@@ -18,7 +18,17 @@
 - Authorize: `https://claude.com/cai/oauth/authorize`
 - Token exchange and refresh: `https://platform.claude.com/v1/oauth/token`
 - Paste-back redirect: `https://platform.claude.com/oauth/code/callback`
-- Scopes: `user:profile user:inference` (Task 1 may widen these; if it does, update every later task)
+- Scopes: `user:profile user:inference`. Verified live: `/api/oauth/usage`
+  403s without `user:profile`.
+- `state` is 32 random bytes (43 base64url chars). Verified live: a 16 byte
+  state is rejected as "Invalid request format", with nothing in the message
+  naming the cause.
+- Every request to the OAuth and usage endpoints sets
+  `User-Agent: claude-cli/2.1.263 (external, cli)`. Verified live: the token
+  endpoint is behind Cloudflare and answers an unrecognised agent with error
+  1010, `browser_signature_banned`.
+- Sign-in is paste-only. Verified live: loopback redirects are rejected for
+  this client.
 - Keychain service: `com.hazime.claudeusagemulti.oauth`
 - Refresh window: 5 minutes (300 seconds) before expiry
 - **No em dashes anywhere**, including code comments, UI copy and commit messages. Use a comma, a colon or a full stop. Write ranges as "2 to 3".
@@ -1019,241 +1029,16 @@ git commit -m "feat: store per-account credentials in the app's own keychain ite
 
 ---
 
-### Task 6: Loopback callback server
+### Task 6: CUT
 
-If Task 1 found that an arbitrary loopback port is rejected, replace `port: .any` with `port: 51703` throughout this task and change the test to use that port.
+Deleted after the Task 1 spike. Loopback redirects are rejected for this
+client: Claude Code's own working authorize request, with `redirect_uri`
+changed to `http://localhost:<port>/callback` and nothing else, is answered
+"Authorization failed / Invalid request format".
 
-**Files:**
-- Create: `app/Auth/LoopbackCallbackServer.swift`
-- Create: `Tests/ClaudeUsageAuthTests/LoopbackCallbackServerTests.swift`
-
-**Interfaces:**
-- Consumes: `CallbackParser`, `CallbackResult`
-- Produces:
-  - `final class LoopbackCallbackServer`
-  - `enum LoopbackError: Error, Equatable` with `case listenFailed(String)`, `case timedOut`, `case cancelled`
-  - `func start(timeout: TimeInterval, onReady: @escaping (Result<UInt16, LoopbackError>) -> Void, onResult: @escaping (Result<CallbackResult, LoopbackError>) -> Void)`
-  - `func cancel()`
-
-- [ ] **Step 1: Write the failing test**
-
-`Tests/ClaudeUsageAuthTests/LoopbackCallbackServerTests.swift`:
-
-```swift
-import Testing
-import Foundation
-@testable import ClaudeUsageAuth
-
-@Suite("Loopback callback server")
-struct LoopbackCallbackServerTests {
-    @Test func capturesTheCodeAndStateFromARealRequest() async throws {
-        let server = LoopbackCallbackServer()
-
-        let port: UInt16 = try await withCheckedThrowingContinuation { continuation in
-            server.start(timeout: 10,
-                         onReady: { continuation.resume(with: $0.mapError { $0 as Error }) },
-                         onResult: { _ in })
-        }
-        #expect(port > 0)
-        server.cancel()
-    }
-
-    @Test func deliversTheCallbackTheBrowserWouldSend() async throws {
-        let server = LoopbackCallbackServer()
-        defer { server.cancel() }
-
-        var deliver: ((Result<CallbackResult, LoopbackError>) -> Void)?
-
-        let result: CallbackResult = try await withCheckedThrowingContinuation { resultContinuation in
-            deliver = { outcome in resultContinuation.resume(with: outcome.mapError { $0 as Error }) }
-
-            server.start(timeout: 10, onReady: { ready in
-                guard case let .success(port) = ready else {
-                    deliver?(.failure(.listenFailed("not ready")))
-                    return
-                }
-                let url = URL(string: "http://127.0.0.1:\(port)/callback?code=abc123&state=st8")!
-                URLSession.shared.dataTask(with: url) { _, _, _ in }.resume()
-            }, onResult: { outcome in
-                deliver?(outcome)
-            })
-        }
-
-        #expect(result == CallbackResult(code: "abc123", state: "st8"))
-    }
-
-    @Test func timesOutWhenNobodyCalls() async throws {
-        let server = LoopbackCallbackServer()
-        defer { server.cancel() }
-
-        let error: LoopbackError = await withCheckedContinuation { continuation in
-            server.start(timeout: 1, onReady: { _ in }, onResult: { outcome in
-                if case let .failure(error) = outcome { continuation.resume(returning: error) }
-            })
-        }
-        #expect(error == .timedOut)
-    }
-}
-```
-
-- [ ] **Step 2: Run to verify they fail**
-
-Run: `./test.sh --filter "Loopback callback server"`
-Expected: FAIL, cannot find `LoopbackCallbackServer` in scope.
-
-- [ ] **Step 3: Write the implementation**
-
-`app/Auth/LoopbackCallbackServer.swift`:
-
-```swift
-import Foundation
-import Network
-
-public enum LoopbackError: Error, Equatable {
-    case listenFailed(String)
-    case timedOut
-    case cancelled
-    case malformedRequest
-}
-
-/// Catches the one redirect the browser makes at the end of a sign-in.
-///
-/// Binds 127.0.0.1 only, answers exactly one request, then shuts down. The
-/// port is ephemeral, so two sign-ins can never collide and no fixed port has
-/// to be reserved.
-public final class LoopbackCallbackServer {
-    private let queue = DispatchQueue(label: "com.hazime.claudeusagemulti.oauth.callback")
-    private var listener: NWListener?
-    private var timeoutWork: DispatchWorkItem?
-    private var onResult: ((Result<CallbackResult, LoopbackError>) -> Void)?
-    private var finished = false
-
-    public init() {}
-
-    public func start(timeout: TimeInterval = 300,
-                      onReady: @escaping (Result<UInt16, LoopbackError>) -> Void,
-                      onResult: @escaping (Result<CallbackResult, LoopbackError>) -> Void) {
-        queue.async {
-            self.onResult = onResult
-
-            let parameters = NWParameters.tcp
-            parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
-            parameters.allowLocalEndpointReuse = true
-
-            let listener: NWListener
-            do {
-                listener = try NWListener(using: parameters)
-            } catch {
-                onReady(.failure(.listenFailed(error.localizedDescription)))
-                return
-            }
-            self.listener = listener
-
-            // Fires exactly once. A caller awaiting a continuation here would
-            // crash if .ready were followed by .failed.
-            var readyReported = false
-            let reportReady: (Result<UInt16, LoopbackError>) -> Void = { outcome in
-                guard !readyReported else { return }
-                readyReported = true
-                onReady(outcome)
-            }
-
-            listener.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    reportReady(.success(listener.port?.rawValue ?? 0))
-                case .failed(let error):
-                    reportReady(.failure(.listenFailed(error.localizedDescription)))
-                    self.finish(.failure(.listenFailed(error.localizedDescription)))
-                default:
-                    break
-                }
-            }
-
-            listener.newConnectionHandler = { [weak self] connection in
-                self?.handle(connection)
-            }
-            listener.start(queue: self.queue)
-
-            let work = DispatchWorkItem { [weak self] in self?.finish(.failure(.timedOut)) }
-            self.timeoutWork = work
-            self.queue.asyncAfter(deadline: .now() + timeout, execute: work)
-        }
-    }
-
-    public func cancel() {
-        queue.async { self.finish(.failure(.cancelled)) }
-    }
-
-    private func handle(_ connection: NWConnection) {
-        connection.start(queue: queue)
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { [weak self] data, _, _, _ in
-            guard let self = self else { return }
-            let request = String(data: data ?? Data(), encoding: .utf8) ?? ""
-            let outcome = Self.parseRequestLine(request)
-
-            let body = outcome == nil
-                ? "<h2>Sign-in failed</h2><p>Go back to Claude Usage and try again.</p>"
-                : "<h2>Signed in</h2><p>You can close this tab.</p>"
-            let response = """
-            HTTP/1.1 200 OK\r
-            Content-Type: text/html; charset=utf-8\r
-            Content-Length: \(body.utf8.count)\r
-            Connection: close\r
-            \r
-            \(body)
-            """
-            connection.send(content: Data(response.utf8), completion: .contentProcessed { _ in
-                connection.cancel()
-                self.queue.async {
-                    if let outcome = outcome {
-                        self.finish(.success(outcome))
-                    } else {
-                        self.finish(.failure(.malformedRequest))
-                    }
-                }
-            })
-        }
-    }
-
-    /// Pulls the target out of "GET /callback?code=..&state=.. HTTP/1.1".
-    static func parseRequestLine(_ request: String) -> CallbackResult? {
-        guard let line = request.split(separator: "\r\n", maxSplits: 1).first else { return nil }
-        let fields = line.split(separator: " ")
-        guard fields.count >= 2 else { return nil }
-        return CallbackParser.parse(String(fields[1]))
-    }
-
-    /// Every exit runs through here, so the caller is answered exactly once and
-    /// the listener is always torn down.
-    private func finish(_ outcome: Result<CallbackResult, LoopbackError>) {
-        guard !finished else { return }
-        finished = true
-        timeoutWork?.cancel()
-        timeoutWork = nil
-        listener?.cancel()
-        listener = nil
-        let handler = onResult
-        onResult = nil
-        if case .failure(.cancelled) = outcome { return }
-        handler?(outcome)
-    }
-}
-```
-
-- [ ] **Step 4: Run to verify they pass**
-
-Run: `./test.sh --filter "Loopback callback server"`
-Expected: PASS, 3 tests.
-
-macOS may show a firewall prompt the first time the test binary listens. Allow it.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add app/Auth/LoopbackCallbackServer.swift Tests/ClaudeUsageAuthTests/LoopbackCallbackServerTests.swift
-git commit -m "feat: catch the OAuth redirect on an ephemeral loopback port"
-```
+Sign-in is paste-only, so there is no redirect to catch. `LoopbackCallbackServer`
+is never written. `CallbackParser` from Task 3 still does the work, parsing
+the `code#state` the paste-back page prints.
 
 ---
 
@@ -1750,12 +1535,11 @@ git commit -m "refactor: move account secrets from preferences into the keychain
 - Delete: `app/ClaudeUsageBar.swift:545-696` (`ClaudeCodeKeychain`)
 
 **Interfaces:**
-- Consumes: `CredentialProvider`, `CredentialOutcome`
+- Consumes: `CredentialProvider`, `CredentialOutcome`, `TokenResponse.accountEmail`
 - Produces:
   - `UsageManager.needsReauth: Bool` (`@Published`)
   - `UsageManager.usingCookieFallback: Bool` (`@Published`)
   - `UsageManager.authSourceLabel: String`
-  - `func UsageManager.signIn(completion: @escaping (String?) -> Void)`
   - `func UsageManager.completeSignIn(paste: String, completion: @escaping (String?) -> Void)`
   - `func UsageManager.signOut()`
 
@@ -1869,42 +1653,9 @@ Clear `reauthNotified` wherever `needsReauth` is set back to false.
 - [ ] **Step 5: Add sign-in, paste and sign-out**
 
 ```swift
-    /// Opens the browser and waits for the redirect on a loopback port.
-    /// The completion carries nil on success, or a message to show.
-    func signIn(completion: @escaping (String?) -> Void) {
-        let server = LoopbackCallbackServer()
-        signInServer = server
-
-        server.start(timeout: 300, onReady: { [weak self] ready in
-            guard let self = self else { return }
-            switch ready {
-            case .success(let port):
-                let redirect = "http://localhost:\(port)/callback"
-                let request = OAuthClient.authorizationRequest(redirectURI: redirect)
-                self.pendingRequest = request
-                NSWorkspace.shared.open(request.url)
-            case .failure(let error):
-                DispatchQueue.main.async { completion("Could not start the sign-in listener: \(error)") }
-            }
-        }, onResult: { [weak self] result in
-            guard let self = self, let request = self.pendingRequest else { return }
-            switch result {
-            case .success(let callback):
-                guard request.accepts(callback) else {
-                    DispatchQueue.main.async { completion("Sign-in did not match the request. Try again.") }
-                    return
-                }
-                self.exchange(callback.code, request: request, completion: completion)
-            case .failure(let error):
-                DispatchQueue.main.async {
-                    completion(error == .timedOut ? "Sign-in timed out. Try again." : "Sign-in failed: \(error)")
-                }
-            }
-        })
-    }
-
-    /// The route for a second account, signed in from a private window where
-    /// the app cannot listen on loopback.
+    /// Opens the browser at the authorize page. The page prints `code#state`
+    /// for the user to paste back, which is the only redirect this client
+    /// accepts.
     func beginPasteSignIn() {
         let request = OAuthClient.authorizationRequest(redirectURI: OAuthEndpoints.pasteRedirect)
         pendingRequest = request
@@ -1949,27 +1700,15 @@ Clear `reauthNotified` wherever `needsReauth` is set back to false.
                 }
                 DispatchQueue.main.async {
                     self.account.hasOAuth = true
+                    self.account.accountEmail = response.accountEmail
                     self.needsReauth = false
                     self.reauthNotified = false
                     self.usingCookieFallback = false
                     self.pendingRequest = nil
                     self.onAccountEdited?(self.account)
-                    self.resolveEmail(response.tokens().accessToken)
                     self.fetchUsage()
                     completion(nil)
                 }
-            }
-        }
-    }
-
-    /// Stamps the account with the email its grant belongs to, so two accounts
-    /// are told apart on sight.
-    private func resolveEmail(_ token: String) {
-        fetchOAuthProfile(token) { [weak self] email, _ in
-            guard let self = self, let email = email else { return }
-            DispatchQueue.main.async {
-                self.account.accountEmail = email
-                self.onAccountEdited?(self.account)
             }
         }
     }
@@ -1991,7 +1730,6 @@ Add the stored properties this needs to `UsageManager`:
 ```swift
     private let credentials: CredentialProvider
     private let oauthClient = OAuthClient()
-    private var signInServer: LoopbackCallbackServer?
     private var pendingRequest: AuthorizationRequest?
 ```
 
@@ -2050,9 +1788,8 @@ Claude Code was signed into."
 Delete `claudeCodeLoginSection` and `setupTokenSection` entirely, along with the `discoveredLogins`, `isDiscovering` and `tokenInput` state they used. Add:
 
 ```swift
-    @State private var signingIn = false
     @State private var pasteInput = ""
-    @State private var showPaste = false
+    @State private var awaitingPaste = false
 
     @ViewBuilder
     private var signInSection: some View {
@@ -2077,27 +1814,15 @@ Delete `claudeCodeLoginSection` and `setupTokenSection` entirely, along with the
                     .truncationMode(.middle)
             }
 
-            Button(manager.needsReauth || !account.hasOAuth ? "Sign in with Claude" : "Sign in again") {
-                signingIn = true
-                manager.errorMessage = "Waiting for the browser..."
-                manager.signIn { problem in
-                    signingIn = false
-                    manager.errorMessage = problem ?? "Signed in, fetching..."
-                }
+            Button(account.hasOAuth && !manager.needsReauth ? "Sign in again" : "Sign in with Claude") {
+                manager.beginPasteSignIn()
+                awaitingPaste = true
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.small)
-            .disabled(signingIn)
 
-            Button(showPaste ? "Hide code entry" : "Already signed in as another account?") {
-                showPaste.toggle()
-                if showPaste { manager.beginPasteSignIn() }
-            }
-            .buttonStyle(.borderless)
-            .font(.caption2)
-
-            if showPaste {
-                Text("Sign in from a private window, then paste the code it shows.")
+            if awaitingPaste {
+                Text("Paste the code the page shows. For a second account, sign in from a private window first.")
                     .font(.caption2)
                     .foregroundColor(Color.secondaryText)
 
@@ -2109,7 +1834,7 @@ Delete `claudeCodeLoginSection` and `setupTokenSection` entirely, along with the
                     manager.completeSignIn(paste: pasteInput) { problem in
                         if problem == nil {
                             pasteInput = ""
-                            showPaste = false
+                            awaitingPaste = false
                         }
                         manager.errorMessage = problem ?? "Signed in, fetching..."
                     }
@@ -2121,7 +1846,9 @@ Delete `claudeCodeLoginSection` and `setupTokenSection` entirely, along with the
     }
 ```
 
-The one explanatory line stays because the private window step is not visible from the control. Nothing else gets a caption.
+The one explanatory line stays: the private window step is not visible from
+the control, and getting it wrong silently re-authorises the first account.
+Nothing else gets a caption.
 
 - [ ] **Step 2: Demote the cookie section**
 

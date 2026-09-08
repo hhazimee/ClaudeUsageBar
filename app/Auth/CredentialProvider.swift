@@ -78,6 +78,23 @@ public final class CredentialProvider {
         }
     }
 
+    /// Direct reads and writes for the UI and for a cookie paste, which do not
+    /// need a refresh and must not trigger one.
+    ///
+    /// These use `queue.sync`, so they are for callers outside the provider.
+    /// Calling one from inside a queue block deadlocks.
+    public func stored(for id: UUID) -> StoredCredential? {
+        queue.sync { store.load(id) }
+    }
+
+    public func storedCookie(for id: UUID) -> String? {
+        stored(for: id)?.cookie
+    }
+
+    public func save(_ credential: StoredCredential, for id: UUID) throws {
+        try queue.sync { try store.save(credential, for: id) }
+    }
+
     /// Drops the OAuth grant but keeps the cookie, so signing out of OAuth
     /// does not silently throw away the fallback the user pasted.
     public func signOut(_ id: UUID) {

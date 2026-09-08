@@ -2,7 +2,6 @@ import SwiftUI
 import AppKit
 import WebKit
 import Carbon
-import CryptoKit
 import Security
 import ServiceManagement
 import UserNotifications
@@ -542,159 +541,6 @@ enum Notifier {
     }
 }
 
-// MARK: - Claude Code credentials
-
-/// Reads the OAuth tokens Claude Code stores in the login keychain.
-///
-/// Strictly read-only. The app never refreshes a token and never writes back,
-/// because refreshing rotates the refresh token and would sign Claude Code
-/// out. An expired token is simply not used: the account falls back to its
-/// cookie until Claude Code next runs, refreshes, and writes a new one.
-enum ClaudeCodeKeychain {
-    /// Every keychain item Claude Code writes is named with this prefix. The
-    /// active login is the bare name; the suffixed ones are other accounts it
-    /// has held.
-    static let servicePrefix = "Claude Code-credentials"
-
-    struct Credential {
-        let service: String
-        let account: String
-        let accessToken: String
-        let expiresAt: Date?
-        let subscriptionType: String?
-
-        var isExpired: Bool {
-            guard let expiresAt = expiresAt else { return false }
-            return expiresAt <= Date()
-        }
-
-        /// Identifies the token without carrying it around. Used to notice
-        /// that the stored credential changed since it was last verified.
-        var tokenHash: String {
-            ClaudeCodeKeychain.hash(accessToken)
-        }
-    }
-
-    static func hash(_ value: String) -> String {
-        let digest = SHA256.hash(data: Data(value.utf8))
-        return digest.map { String(format: "%02x", $0) }.joined().prefix(16).description
-    }
-
-    /// How many items we are willing to open before giving up.
-    ///
-    /// Reading an item's data is what triggers the access prompt, and there
-    /// can be a dozen of these items from past logins. Claude Code holds one
-    /// login at a time, so opening a few in the right order finds it, and the
-    /// cap stops a failed search turning into a wall of dialogs.
-    private static let maxReads = 3
-
-    /// The Claude Code login currently in the keychain, if it can be read.
-    ///
-    /// Listing item names does not prompt; only reading their contents does.
-    /// So the names are listed first, ordered by how likely each is to be the
-    /// live login, and only those are opened.
-    static func discover() -> [Credential] {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecMatchLimit as String: kSecMatchLimitAll,
-            kSecReturnAttributes as String: true
-        ]
-
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let items = result as? [[String: Any]] else {
-            if status != errSecItemNotFound {
-                NSLog("🔑 Keychain search failed (OSStatus \(status))")
-            }
-            return []
-        }
-
-        let candidates = items.compactMap { item -> (service: String, account: String)? in
-            guard let service = item[kSecAttrService as String] as? String,
-                  service.hasPrefix(servicePrefix) else { return nil }
-            return (service, item[kSecAttrAccount as String] as? String ?? "")
-        }
-        .sorted(by: priority)
-
-        NSLog("🔑 \(candidates.count) Claude Code keychain item(s), opening up to \(maxReads)")
-
-        var found: [Credential] = []
-        for candidate in candidates.prefix(maxReads) {
-            guard let credential = read(service: candidate.service, account: candidate.account) else { continue }
-            found.append(credential)
-            // The live login is enough. Anything older is a past sign-in that
-            // expired months ago and is not worth another prompt.
-            if !credential.isExpired { break }
-        }
-        return found
-    }
-
-    /// Orders items by how likely each is to hold the current login: the
-    /// unsuffixed name is the one Claude Code writes on sign-in, and the
-    /// account attribute is the local username.
-    private static func priority(_ a: (service: String, account: String),
-                                 _ b: (service: String, account: String)) -> Bool {
-        func rank(_ item: (service: String, account: String)) -> Int {
-            var score = 0
-            if item.service == servicePrefix { score -= 2 }
-            if item.account == NSUserName() { score -= 1 }
-            return score
-        }
-        let (ra, rb) = (rank(a), rank(b))
-        return ra == rb ? a.service < b.service : ra < rb
-    }
-
-    /// Re-reads one item. Called on every fetch so a refresh Claude Code wrote
-    /// a minute ago is picked up without restarting the app.
-    static func read(service: String, account: String) -> Credential? {
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-            kSecReturnAttributes as String: true,
-            kSecReturnData as String: true
-        ]
-        if !account.isEmpty {
-            query[kSecAttrAccount as String] = account
-        }
-
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess,
-              let item = result as? [String: Any],
-              let data = item[kSecValueData as String] as? Data else {
-            if status != errSecItemNotFound {
-                NSLog("🔑 Could not read '\(service)' (OSStatus \(status))")
-            }
-            return nil
-        }
-        return parse(data, service: service, account: account)
-    }
-
-    /// Pulls the claude.ai login out of a credentials blob. Items that hold
-    /// only MCP server logins return nil.
-    private static func parse(_ data: Data, service: String, account: String) -> Credential? {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let oauth = json["claudeAiOauth"] as? [String: Any],
-              let token = oauth["accessToken"] as? String,
-              !token.isEmpty else { return nil }
-
-        // expiresAt is milliseconds since the epoch.
-        var expiresAt: Date?
-        if let millis = oauth["expiresAt"] as? Double {
-            expiresAt = Date(timeIntervalSince1970: millis / 1000)
-        }
-
-        return Credential(
-            service: service,
-            account: account,
-            accessToken: token,
-            expiresAt: expiresAt,
-            subscriptionType: oauth["subscriptionType"] as? String
-        )
-    }
-}
-
 // MARK: - Accounts
 
 /// One Claude login the app monitors.
@@ -960,6 +806,11 @@ enum AccountStore {
 class AccountsController: ObservableObject {
     @Published private(set) var managers: [UsageManager] = []
 
+    /// One provider for every account, so refreshes queue behind a single
+    /// lock. Two managers refreshing the same grant at once would each rotate
+    /// the refresh token and cost the user a sign-in.
+    private let credentials = CredentialProvider()
+
     // App-wide settings. These used to live on UsageManager, which stopped
     // working once there was more than one of it.
     @Published var usageNotificationsEnabled: Bool = true
@@ -983,7 +834,7 @@ class AccountsController: ObservableObject {
     var accounts: [Account] { managers.map(\.account) }
 
     private func makeManager(_ account: Account) -> UsageManager {
-        let manager = UsageManager(account: account)
+        let manager = UsageManager(account: account, credentials: credentials)
         manager.notificationsEnabled = { [weak self] in self?.usageNotificationsEnabled ?? true }
         manager.onUsageChanged = { [weak self] in self?.refreshStatusBar() }
         manager.onAccountEdited = { [weak self] _ in self?.persist() }
@@ -1165,145 +1016,120 @@ class UsageManager: ObservableObject {
     /// other's "already warned at 75%" bookkeeping.
     private var thresholdKey: String { "last_notified_threshold_\(account.id.uuidString)" }
 
-    init(account: Account) {
+    /// The one door to this account's credential. Shared with every other
+    /// manager so refreshes are serialised across accounts.
+    private let credentials: CredentialProvider
+    private let oauthClient = OAuthClient()
+    private var pendingRequest: AuthorizationRequest?
+
+    init(account: Account, credentials: CredentialProvider) {
         self.account = account
+        self.credentials = credentials
         self.lastNotifiedThreshold = UserDefaults.standard.integer(forKey: thresholdKey)
     }
 
-    /// The cookie for this account.
-    private var sessionCookie: String { account.cookie }
-
     // MARK: - Authentication
 
-    /// How this account authenticates, in the order the app prefers.
-    ///
-    /// OAuth is preferred because it is account-scoped (no org ID lookup, so
-    /// none of that can fail), it is not behind the bot challenge that fronts
-    /// claude.ai, and a Claude Code login refreshes itself. The cookie stays
-    /// as the fallback for accounts Claude Code is not signed into.
-    enum AuthSource: Equatable {
-        /// A Claude Code login read live from the keychain.
-        case keychain(ClaudeCodeKeychain.Credential)
-        /// A long-lived token pasted from `claude setup-token`.
-        case token(String)
-        /// The pasted claude.ai session cookie.
-        case cookie
-        /// Nothing configured, or the only thing configured cannot be used.
-        case none
+    /// Set when the account's grant is gone and only a new sign-in fixes it.
+    @Published var needsReauth: Bool = false
 
-        static func == (lhs: AuthSource, rhs: AuthSource) -> Bool {
-            switch (lhs, rhs) {
-            case let (.keychain(a), .keychain(b)): return a.accessToken == b.accessToken
-            case let (.token(a), .token(b)):       return a == b
-            case (.cookie, .cookie), (.none, .none): return true
-            default: return false
-            }
-        }
+    /// Set when OAuth failed but a stored cookie is keeping numbers flowing.
+    @Published var usingCookieFallback: Bool = false
 
-        var bearerToken: String? {
-            switch self {
-            case .keychain(let credential): return credential.accessToken
-            case .token(let token):         return token
-            case .cookie, .none:            return nil
-            }
-        }
-    }
+    /// One notification per failure, not one per refresh cycle.
+    private var reauthNotified = false
 
-    /// Resolves the credential to use right now.
-    ///
-    /// The keychain is re-read on every call rather than cached, so a token
-    /// Claude Code refreshed a moment ago is used immediately. An expired one
-    /// is skipped rather than refreshed: refreshing rotates the refresh token
-    /// and would sign Claude Code out.
-    var authSource: AuthSource {
-        if let service = account.keychainService,
-           let credential = ClaudeCodeKeychain.read(service: service, account: account.keychainAccount ?? "") {
-            if !credential.isExpired {
-                return .keychain(credential)
-            }
-            NSLog("🔑 '\(account.displayName)': Claude Code token expired, falling back")
-        }
-
-        if let token = account.oauthToken, !token.isEmpty {
-            return .token(token)
-        }
-
-        return sessionCookie.isEmpty ? .none : .cookie
-    }
-
-    /// A short description of the live credential, for the popup.
     var authSourceLabel: String {
-        switch authSource {
-        case .keychain:
-            let email = account.accountEmail.map { " (\($0))" } ?? ""
-            return "Claude Code login\(email)"
-        case .token:  return "Setup token"
-        case .cookie: return "Session cookie"
-        case .none:   return "Not configured"
+        if needsReauth { return "Sign in again" }
+        if usingCookieFallback { return "Session cookie (sign-in expired)" }
+        if account.hasOAuth { return account.accountEmail ?? "Signed in" }
+        return account.hasCookie ? "Session cookie" : "Not configured"
+    }
+
+    var hasCredential: Bool { account.hasOAuth || account.hasCookie }
+
+    private func reportReauthNeeded() {
+        guard !reauthNotified else { return }
+        reauthNotified = true
+        Notifier.send(title: "\(account.displayName) needs a new sign-in",
+                      body: usingCookieFallback
+                          ? "Using its session cookie for now."
+                          : "Usage will not update until you sign in.")
+    }
+
+    // MARK: - Sign-in
+
+    /// Opens the browser at the authorize page. The page prints `code#state`
+    /// for the user to paste back, which is the only redirect this client
+    /// accepts.
+    func beginPasteSignIn() {
+        let request = OAuthClient.authorizationRequest(redirectURI: OAuthEndpoints.pasteRedirect)
+        pendingRequest = request
+        NSWorkspace.shared.open(request.url)
+    }
+
+    /// Redeems the pasted code. Returns nil on success, or a message to show.
+    func completeSignIn(paste: String, completion: @escaping (String?) -> Void) {
+        guard let request = pendingRequest else {
+            completion("Start a sign-in first.")
+            return
         }
-    }
-
-    /// True when anything at all is configured, whether or not it still works.
-    var hasCredential: Bool {
-        !sessionCookie.isEmpty
-            || !(account.oauthToken ?? "").isEmpty
-            || account.keychainService != nil
-    }
-
-    /// Binds this account to a Claude Code login. Returns nil on success, or a
-    /// message explaining why it cannot be used.
-    @discardableResult
-    func bindKeychainLogin(_ credential: ClaudeCodeKeychain.Credential, email: String?) -> String? {
-        guard !credential.isExpired else {
-            return "That Claude Code login has expired. Run Claude Code once to refresh it."
+        guard let callback = CallbackParser.parse(paste) else {
+            completion("That does not look like a sign-in code.")
+            return
         }
-        account.keychainService = credential.service
-        account.keychainAccount = credential.account
-        account.accountEmail = email
-        account.verifiedTokenHash = credential.tokenHash
-        onAccountEdited?(account)
-        NSLog("🔑 '\(account.displayName)' bound to \(credential.service)\(email.map { " (\($0))" } ?? "")")
-        return nil
+        guard request.accepts(callback) else {
+            completion("That code is from a different sign-in. Try again.")
+            return
+        }
+        exchange(callback.code, request: request, completion: completion)
     }
 
-    func unbindKeychainLogin() {
-        account.keychainService = nil
-        account.keychainAccount = nil
-        account.verifiedTokenHash = nil
-        onAccountEdited?(account)
-    }
-
-    /// Saves a token pasted from `claude setup-token`. Returns nil on success,
-    /// or a message explaining why the paste cannot work.
-    @discardableResult
-    func saveOAuthToken(_ raw: String) -> String? {
-        let token = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .joined()
-
-        guard !token.isEmpty else { return "Token field is empty" }
-
-        // `claude setup-token` prints an sk-ant-oat01 token. A session cookie
-        // (sk-ant-sid02) pasted here would 401 with nothing explaining why.
-        guard token.hasPrefix("sk-ant-oat") else {
-            if token.hasPrefix("sk-ant-sid") {
-                return "That is a session cookie, not a token. Paste it in the cookie field instead."
+    private func exchange(_ code: String,
+                          request: AuthorizationRequest,
+                          completion: @escaping (String?) -> Void) {
+        oauthClient.exchange(code: code,
+                             verifier: request.verifier,
+                             redirectURI: request.redirectURI,
+                             state: request.state) { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .failure(let error):
+                DispatchQueue.main.async { completion("Sign-in failed: \(error)") }
+            case .success(let response):
+                var stored = self.credentials.stored(for: self.account.id) ?? StoredCredential()
+                stored.oauth = response.tokens()
+                do {
+                    try self.credentials.save(stored, for: self.account.id)
+                } catch {
+                    DispatchQueue.main.async { completion("Could not save the sign-in: \(error)") }
+                    return
+                }
+                DispatchQueue.main.async {
+                    self.account.hasOAuth = true
+                    self.account.accountEmail = response.accountEmail
+                    self.needsReauth = false
+                    self.reauthNotified = false
+                    self.usingCookieFallback = false
+                    self.pendingRequest = nil
+                    self.onAccountEdited?(self.account)
+                    self.fetchUsage()
+                    completion(nil)
+                }
             }
-            return "That does not look like a setup token. It should start with sk-ant-oat."
         }
-
-        account.oauthToken = token
-        account.accountEmail = nil
-        account.verifiedTokenHash = nil
-        onAccountEdited?(account)
-        NSLog("🔑 Setup token saved for '\(account.displayName)' (\(token.count) chars)")
-        return nil
     }
 
-    func clearOAuthToken() {
-        account.oauthToken = nil
+    /// Drops the OAuth grant. The cookie, if there is one, stays.
+    func signOut() {
+        credentials.signOut(account.id)
+        account.hasOAuth = false
+        account.accountEmail = nil
+        needsReauth = false
+        reauthNotified = false
+        usingCookieFallback = false
         onAccountEdited?(account)
+        fetchUsage()
     }
 
     var sessionPercent: Int {
@@ -1364,18 +1190,29 @@ class UsageManager: ObservableObject {
     @discardableResult
     func saveSessionCookie(_ cookie: String) -> String? {
         NSLog("ClaudeUsage: Saving cookie for '\(account.displayName)', length: \(cookie.count)")
-        account.cookie = cookie
+
+        var stored = credentials.stored(for: account.id) ?? StoredCredential()
+        stored.cookie = cookie
+        do {
+            try credentials.save(stored, for: account.id)
+        } catch {
+            NSLog("❌ Could not save cookie for '\(account.displayName)': \(error)")
+            return "Could not save that cookie to the keychain"
+        }
+
+        account.hasCookie = !cookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         onAccountEdited?(account)
 
-        guard let key = cookieValue(named: "sessionKey") else {
-            NSLog("⚠️ Cookie saved but has no sessionKey. \(cookieFingerprint)")
+        let header = Self.cookieHeader(from: cookie)
+        guard let key = Self.cookieValue(named: "sessionKey", in: header) else {
+            NSLog("⚠️ Cookie saved but has no sessionKey. \(Self.cookieFingerprint(header))")
             return "No sessionKey in that cookie - copy the whole Cookie header, not one line of it"
         }
 
         // A session key is "sk-ant-sid01-...". Catch the common mistake of
         // copying anthropic-device-id, which is a bare 36-character UUID.
         guard key.hasPrefix("sk-ant-") else {
-            NSLog("⚠️ Cookie saved but sessionKey looks wrong. \(cookieFingerprint)")
+            NSLog("⚠️ Cookie saved but sessionKey looks wrong. \(Self.cookieFingerprint(header))")
             return key.count == 36
                 ? "That is your device ID, not your session key. Copy the sessionKey row (starts sk-ant-)."
                 : "That does not look like a session key. It should start with sk-ant-."
@@ -1387,7 +1224,17 @@ class UsageManager: ObservableObject {
 
     func clearSessionCookie() {
         NSLog("ClaudeUsage: Clearing cookie for '\(account.displayName)'")
-        account.cookie = ""
+
+        var stored = credentials.stored(for: account.id) ?? StoredCredential()
+        stored.cookie = nil
+        do {
+            try credentials.save(stored, for: account.id)
+        } catch {
+            NSLog("❌ Could not clear cookie for '\(account.displayName)': \(error)")
+        }
+
+        account.hasCookie = false
+        usingCookieFallback = false
         onAccountEdited?(account)
 
         // Reset all data
@@ -1422,8 +1269,8 @@ class UsageManager: ObservableObject {
     /// Accepts either a full cookie header pasted from DevTools
     /// ("anthropic-device-id=...; sessionKey=sk-ant-...; lastActiveOrg=...")
     /// or just the bare sessionKey value.
-    private var cookieHeader: String {
-        var value = sessionCookie.trimmingCharacters(in: .whitespacesAndNewlines)
+    private static func cookieHeader(from raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
 
         // Tolerate a pasted "Cookie: ..." header line.
         if value.lowercased().hasPrefix("cookie:") {
@@ -1442,9 +1289,9 @@ class UsageManager: ObservableObject {
         return value
     }
 
-    /// Reads a single cookie out of the pasted cookie string.
-    private func cookieValue(named name: String) -> String? {
-        for part in cookieHeader.components(separatedBy: ";") {
+    /// Reads a single cookie out of a cookie header.
+    private static func cookieValue(named name: String, in header: String) -> String? {
+        for part in header.components(separatedBy: ";") {
             let trimmed = part.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("\(name)=") {
                 let value = String(trimmed.dropFirst(name.count + 1))
@@ -1454,30 +1301,25 @@ class UsageManager: ObservableObject {
         return nil
     }
 
-    /// True when the pasted cookie carries the credential claude.ai authenticates with.
-    private var hasSessionKey: Bool {
-        cookieValue(named: "sessionKey") != nil
-    }
-
     /// Names of the cookies pasted, plus the shape of the session key.
     /// Logs enough to diagnose a bad paste without logging the credential.
-    private var cookieFingerprint: String {
-        let names = cookieHeader.components(separatedBy: ";")
+    private static func cookieFingerprint(_ header: String) -> String {
+        let names = header.components(separatedBy: ";")
             .compactMap { $0.trimmingCharacters(in: .whitespaces).components(separatedBy: "=").first }
             .filter { !$0.isEmpty }
 
         var key = "sessionKey missing"
-        if let value = cookieValue(named: "sessionKey") {
+        if let value = cookieValue(named: "sessionKey", in: header) {
             key = "sessionKey \(value.count) chars, starts \(value.prefix(11))"
         }
         return "[cookies: \(names.joined(separator: ", ")) | \(key)]"
     }
 
     /// Every claude.ai request needs the same browser-shaped headers.
-    private func makeRequest(_ url: URL) -> URLRequest {
+    private func makeRequest(_ url: URL, cookie: String) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
+        request.setValue(Self.cookieHeader(from: cookie), forHTTPHeaderField: "Cookie")
         request.setValue("*/*", forHTTPHeaderField: "Accept")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("https://claude.ai", forHTTPHeaderField: "Origin")
@@ -1487,16 +1329,18 @@ class UsageManager: ObservableObject {
         return request
     }
 
-    func fetchOrganizationId(completion: @escaping (String?, String?) -> Void) {
+    func fetchOrganizationId(cookie: String, completion: @escaping (String?, String?) -> Void) {
+        let header = Self.cookieHeader(from: cookie)
+
         // Fast path: the org ID is usually already in the pasted cookie.
-        if let orgId = cookieValue(named: "lastActiveOrg") {
+        if let orgId = Self.cookieValue(named: "lastActiveOrg", in: header) {
             NSLog("📋 Found org ID in cookie: \(orgId)")
             completion(orgId, nil)
             return
         }
 
         // Without a sessionKey any API call can only come back 401.
-        guard hasSessionKey else {
+        guard Self.cookieValue(named: "sessionKey", in: header) != nil else {
             NSLog("❌ Pasted cookie contains no sessionKey")
             completion(nil, "Cookie has no sessionKey - copy the whole Cookie header")
             return
@@ -1504,27 +1348,27 @@ class UsageManager: ObservableObject {
 
         // /api/organizations is the stable endpoint. Bootstrap is a fallback
         // because its shape has changed before and may change again.
-        fetchOrgIdFromOrganizations { orgId, reason in
+        fetchOrgIdFromOrganizations(cookie: cookie) { orgId, reason in
             if let orgId = orgId {
                 completion(orgId, nil)
                 return
             }
             NSLog("↩️ /api/organizations failed (\(reason ?? "unknown")), trying bootstrap")
-            self.fetchOrgIdFromBootstrap { orgId, bootstrapReason in
+            self.fetchOrgIdFromBootstrap(cookie: cookie) { orgId, bootstrapReason in
                 completion(orgId, orgId == nil ? (bootstrapReason ?? reason) : nil)
             }
         }
     }
 
-    private func fetchOrgIdFromOrganizations(completion: @escaping (String?, String?) -> Void) {
+    private func fetchOrgIdFromOrganizations(cookie: String, completion: @escaping (String?, String?) -> Void) {
         guard let url = URL(string: "https://claude.ai/api/organizations") else {
             completion(nil, "Invalid organizations URL")
             return
         }
 
-        NSLog("📡 Fetching /api/organizations for org ID... \(cookieFingerprint)")
+        NSLog("📡 Fetching /api/organizations for org ID... \(Self.cookieFingerprint(Self.cookieHeader(from: cookie)))")
 
-        URLSession.shared.dataTask(with: makeRequest(url)) { data, response, error in
+        URLSession.shared.dataTask(with: makeRequest(url, cookie: cookie)) { data, response, error in
             if let error = error {
                 NSLog("❌ Organizations network error: \(error.localizedDescription)")
                 completion(nil, "Network error")
@@ -1564,7 +1408,7 @@ class UsageManager: ObservableObject {
         }.resume()
     }
 
-    private func fetchOrgIdFromBootstrap(completion: @escaping (String?, String?) -> Void) {
+    private func fetchOrgIdFromBootstrap(cookie: String, completion: @escaping (String?, String?) -> Void) {
         guard let url = URL(string: "https://claude.ai/api/bootstrap") else {
             completion(nil, "Invalid bootstrap URL")
             return
@@ -1572,7 +1416,7 @@ class UsageManager: ObservableObject {
 
         NSLog("📡 Fetching bootstrap to get org ID...")
 
-        URLSession.shared.dataTask(with: makeRequest(url)) { data, response, error in
+        URLSession.shared.dataTask(with: makeRequest(url, cookie: cookie)) { data, response, error in
             if let error = error {
                 NSLog("❌ Bootstrap network error: \(error.localizedDescription)")
                 completion(nil, "Network error")
@@ -1635,27 +1479,55 @@ class UsageManager: ObservableObject {
     }
 
     func fetchUsage() {
-        let source = authSource
-
-        guard source != .none else {
-            DispatchQueue.main.async {
-                self.errorMessage = self.hasCredential
-                    ? "Claude Code login expired and no cookie set"
-                    : "No credential set"
-                self.updateStatusBar()
-            }
-            return
-        }
-
         isLoading = true
         errorMessage = nil
 
-        if let token = source.bearerToken {
-            fetchUsageViaOAuth(token, source: source)
-            return
-        }
+        credentials.credential(for: account.id) { [weak self] outcome in
+            guard let self = self else { return }
+            switch outcome {
+            case .token(let token):
+                self.needsReauth = false
+                self.reauthNotified = false
+                self.usingCookieFallback = false
+                self.fetchUsageViaOAuth(token)
 
-        fetchUsageViaCookie()
+            case .cookie(let cookie):
+                // OAuth is gone but the cookie still works, so numbers keep
+                // updating while the user gets around to signing in again.
+                self.needsReauth = self.account.hasOAuth
+                self.usingCookieFallback = self.account.hasOAuth
+                if self.needsReauth {
+                    self.reportReauthNeeded()
+                } else {
+                    self.reauthNotified = false
+                }
+                self.fetchUsageViaCookie(cookie)
+
+            case .needsReauth(let reason):
+                NSLog("🔑 '\(self.account.displayName)' needs a new sign-in: \(reason)")
+                self.isLoading = false
+                self.needsReauth = true
+                self.usingCookieFallback = false
+                self.errorMessage = "Sign in again"
+                self.reportReauthNeeded()
+                self.updateStatusBar()
+
+            case .unavailable(let reason):
+                // Temporary. Leave the badge alone and try again next cycle.
+                NSLog("⚠️ '\(self.account.displayName)': \(reason)")
+                self.isLoading = false
+                self.errorMessage = "Could not reach Anthropic"
+                self.updateStatusBar()
+
+            case .notConfigured:
+                self.isLoading = false
+                self.needsReauth = false
+                self.reauthNotified = false
+                self.usingCookieFallback = false
+                self.errorMessage = "Sign in to see usage"
+                self.updateStatusBar()
+            }
+        }
     }
 
     // MARK: - OAuth fetch
@@ -1674,7 +1546,7 @@ class UsageManager: ObservableObject {
         return request
     }
 
-    private func fetchUsageViaOAuth(_ token: String, source: AuthSource) {
+    private func fetchUsageViaOAuth(_ token: String) {
         guard let request = makeOAuthRequest("/api/oauth/usage", token: token) else {
             DispatchQueue.main.async {
                 self.errorMessage = "Invalid usage URL"
@@ -1700,17 +1572,24 @@ class UsageManager: ObservableObject {
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 NSLog("📡 OAuth usage status: \(status)")
 
-                // 401 means the token is dead: expired, or revoked by a
-                // sign-out. Drop to the cookie if there is one, rather than
-                // showing an error for an account that can still be read.
+                // The provider handed over a token it considered fresh and
+                // the API refused it, so the grant is gone. Drop to the cookie if
+                // there is one rather than showing an error for an account
+                // that can still be read.
                 if status == 401 || status == 403 {
-                    if !self.sessionCookie.isEmpty {
+                    self.needsReauth = true
+                    if let cookie = self.credentials.storedCookie(for: self.account.id),
+                       !cookie.isEmpty {
                         NSLog("↩️ Token rejected (HTTP \(status)), falling back to cookie")
                         self.isLoading = true
-                        self.fetchUsageViaCookie()
+                        self.usingCookieFallback = true
+                        self.reportReauthNeeded()
+                        self.fetchUsageViaCookie(cookie)
                         return
                     }
-                    self.errorMessage = self.tokenRejectedMessage(for: source, status: status)
+                    self.usingCookieFallback = false
+                    self.errorMessage = "Sign in again"
+                    self.reportReauthNeeded()
                     self.updateStatusBar()
                     return
                 }
@@ -1724,94 +1603,13 @@ class UsageManager: ObservableObject {
                 self.parseUsageData(data)
                 self.updateStatusBar()
             }
-
-            self.verifyIdentityIfNeeded(token, source: source)
-        }.resume()
-    }
-
-    private func tokenRejectedMessage(for source: AuthSource, status: Int) -> String {
-        switch source {
-        case .keychain:
-            return "Claude Code login rejected (HTTP \(status)) - sign in again with claude auth login"
-        case .token:
-            return "Token rejected (HTTP \(status)) - run claude setup-token for a new one"
-        default:
-            return "Credential rejected (HTTP \(status))"
-        }
-    }
-
-    /// Confirms whose account a credential belongs to.
-    ///
-    /// Claude Code holds one login at a time, so a bound account would
-    /// silently start reporting somebody else's numbers after `claude auth
-    /// login`. The check runs only when the stored token differs from the one
-    /// last verified, which is on a refresh or a switch, not on every fetch.
-    private func verifyIdentityIfNeeded(_ token: String, source: AuthSource) {
-        let hash = ClaudeCodeKeychain.hash(token)
-        guard account.verifiedTokenHash != hash else { return }
-
-        fetchOAuthProfile(token) { [weak self] email, _ in
-            guard let self = self else { return }
-            DispatchQueue.main.async {
-                guard let email = email else { return }
-
-                let previous = self.account.accountEmail
-                self.account.verifiedTokenHash = hash
-                self.account.accountEmail = email
-                self.onAccountEdited?(self.account)
-
-                guard case .keychain = source, let previous = previous, previous != email else {
-                    NSLog("👤 '\(self.account.displayName)' verified as \(email)")
-                    return
-                }
-
-                // Claude Code is signed into a different account than the one
-                // this was bound to. Stop reading it: wrong numbers are worse
-                // than no numbers.
-                NSLog("⚠️ '\(self.account.displayName)' was bound to \(previous) but Claude Code now holds \(email). Unbinding.")
-                self.unbindKeychainLogin()
-                self.account.accountEmail = previous
-                self.onAccountEdited?(self.account)
-                self.errorMessage = "Claude Code is now signed in as \(email), not \(previous)"
-                self.fetchUsage()
-            }
-        }
-    }
-
-    /// Resolves the email and organisation a token belongs to.
-    func fetchOAuthProfile(_ token: String, completion: @escaping (String?, String?) -> Void) {
-        guard let request = makeOAuthRequest("/api/oauth/profile", token: token) else {
-            completion(nil, "Invalid profile URL")
-            return
-        }
-
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            if let error = error {
-                completion(nil, "Network error: \(error.localizedDescription)")
-                return
-            }
-
-            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            guard status == 200, let data = data,
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                completion(nil, status == 401 || status == 403
-                    ? "Credential rejected (HTTP \(status))"
-                    : "Profile lookup failed (HTTP \(status))")
-                return
-            }
-
-            guard let email = (json["account"] as? [String: Any])?["email"] as? String else {
-                completion(nil, "No email in profile response")
-                return
-            }
-            completion(email, nil)
         }.resume()
     }
 
     // MARK: - Cookie fetch
 
-    private func fetchUsageViaCookie() {
-        guard !sessionCookie.isEmpty else {
+    private func fetchUsageViaCookie(_ cookie: String) {
+        guard !cookie.isEmpty else {
             DispatchQueue.main.async {
                 self.errorMessage = "Session cookie not set"
                 self.isLoading = false
@@ -1821,7 +1619,7 @@ class UsageManager: ObservableObject {
         }
 
         // Extract org ID from cookie
-        fetchOrganizationId { [weak self] orgId, failureReason in
+        fetchOrganizationId(cookie: cookie) { [weak self] orgId, failureReason in
             guard let self = self, let orgId = orgId else {
                 DispatchQueue.main.async {
                     self?.errorMessage = failureReason ?? "Could not get org ID from cookie"
@@ -1830,16 +1628,16 @@ class UsageManager: ObservableObject {
                 return
             }
 
-            self.fetchUsageWithOrgId(orgId)
-            self.fetchExtraUsage(orgId)
-            self.fetchFreeCredits(orgId)
+            self.fetchUsageWithOrgId(orgId, cookie: cookie)
+            self.fetchExtraUsage(orgId, cookie: cookie)
+            self.fetchFreeCredits(orgId, cookie: cookie)
         }
     }
 
     // Remaining free/promo credits (balance) from /prepaid/credits.
-    func fetchFreeCredits(_ orgId: String) {
+    func fetchFreeCredits(_ orgId: String, cookie: String) {
         guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/prepaid/credits") else { return }
-        let request = makeRequest(url)
+        let request = makeRequest(url, cookie: cookie)
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
             DispatchQueue.main.async {
@@ -1866,9 +1664,9 @@ class UsageManager: ObservableObject {
     }
 
     // Extra usage spend + monthly limit live on a separate endpoint (not /usage).
-    func fetchExtraUsage(_ orgId: String) {
+    func fetchExtraUsage(_ orgId: String, cookie: String) {
         guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/overage_spend_limit") else { return }
-        let request = makeRequest(url)
+        let request = makeRequest(url, cookie: cookie)
 
         URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
             DispatchQueue.main.async {
@@ -1893,7 +1691,7 @@ class UsageManager: ObservableObject {
         }.resume()
     }
 
-    func fetchUsageWithOrgId(_ orgId: String) {
+    func fetchUsageWithOrgId(_ orgId: String, cookie: String) {
         let urlString = "https://claude.ai/api/organizations/\(orgId)/usage"
 
         guard let url = URL(string: urlString) else {
@@ -1904,7 +1702,7 @@ class UsageManager: ObservableObject {
             return
         }
 
-        let request = makeRequest(url)
+        let request = makeRequest(url, cookie: cookie)
 
         NSLog("🔍 Fetching from: \(urlString)")
 
@@ -3856,7 +3654,7 @@ struct AccountUsageSection: View {
         .onAppear {
             sessionCookieInput = ""
             tokenInput = ""
-            hasSavedCookie = !account.cookie.isEmpty
+            hasSavedCookie = account.hasCookie
         }
         .onChange(of: showingCookieInput) { isOpen in
             // Reading the keychain can prompt, so only do it when the user

@@ -91,8 +91,22 @@ public final class CredentialProvider {
         stored(for: id)?.cookie
     }
 
-    public func save(_ credential: StoredCredential, for id: UUID) throws {
-        try queue.sync { try store.save(credential, for: id) }
+    /// Reads and writes in one queue block, so a refresh committing between a
+    /// separate read and write cannot be clobbered by a stale snapshot. Losing
+    /// a refresh that way strands an already rotated refresh token and costs
+    /// the user a sign-in.
+    ///
+    /// Emptying the credential deletes the item rather than leaving a husk.
+    public func mutate(_ id: UUID, _ change: (inout StoredCredential) -> Void) throws {
+        try queue.sync {
+            var credential = store.load(id) ?? StoredCredential()
+            change(&credential)
+            if credential.isEmpty {
+                store.delete(id)
+            } else {
+                try store.save(credential, for: id)
+            }
+        }
     }
 
     /// Drops the OAuth grant but keeps the cookie, so signing out of OAuth

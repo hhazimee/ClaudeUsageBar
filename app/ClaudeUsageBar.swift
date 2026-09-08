@@ -1045,8 +1045,10 @@ class UsageManager: ObservableObject {
     private var reauthNotified = false
 
     var authSourceLabel: String {
-        if needsReauth { return "Sign in again" }
+        // The fallback state is the more specific of the two and they are set
+        // together, so it has to be tested first or it never renders.
         if usingCookieFallback { return "Session cookie (sign-in expired)" }
+        if needsReauth { return "Sign in again" }
         if account.hasOAuth { return account.accountEmail ?? "Signed in" }
         return account.hasCookie ? "Session cookie" : "Not configured"
     }
@@ -1102,10 +1104,8 @@ class UsageManager: ObservableObject {
             case .failure(let error):
                 DispatchQueue.main.async { completion("Sign-in failed: \(error)") }
             case .success(let response):
-                var stored = self.credentials.stored(for: self.account.id) ?? StoredCredential()
-                stored.oauth = response.tokens()
                 do {
-                    try self.credentials.save(stored, for: self.account.id)
+                    try self.credentials.mutate(self.account.id) { $0.oauth = response.tokens() }
                 } catch {
                     DispatchQueue.main.async { completion("Could not save the sign-in: \(error)") }
                     return
@@ -1196,10 +1196,8 @@ class UsageManager: ObservableObject {
     func saveSessionCookie(_ cookie: String) -> String? {
         NSLog("ClaudeUsage: Saving cookie for '\(account.displayName)', length: \(cookie.count)")
 
-        var stored = credentials.stored(for: account.id) ?? StoredCredential()
-        stored.cookie = cookie
         do {
-            try credentials.save(stored, for: account.id)
+            try credentials.mutate(account.id) { $0.cookie = cookie }
         } catch {
             NSLog("❌ Could not save cookie for '\(account.displayName)': \(error)")
             return "Could not save that cookie to the keychain"
@@ -1230,10 +1228,8 @@ class UsageManager: ObservableObject {
     func clearSessionCookie() {
         NSLog("ClaudeUsage: Clearing cookie for '\(account.displayName)'")
 
-        var stored = credentials.stored(for: account.id) ?? StoredCredential()
-        stored.cookie = nil
         do {
-            try credentials.save(stored, for: account.id)
+            try credentials.mutate(account.id) { $0.cookie = nil }
         } catch {
             NSLog("❌ Could not clear cookie for '\(account.displayName)': \(error)")
         }
@@ -1491,9 +1487,10 @@ class UsageManager: ObservableObject {
             guard let self = self else { return }
             switch outcome {
             case .token(let token):
-                self.needsReauth = false
-                self.reauthNotified = false
-                self.usingCookieFallback = false
+                // Nothing is cleared here. A grant revoked on claude.ai still
+                // returns a token until its clock expiry, so believing the
+                // token would reset the badge and re-arm the notification on
+                // every cycle. The fetch itself is the proof.
                 self.fetchUsageViaOAuth(token)
 
             case .cookie(let cookie):
@@ -1501,11 +1498,7 @@ class UsageManager: ObservableObject {
                 // updating while the user gets around to signing in again.
                 self.needsReauth = self.account.hasOAuth
                 self.usingCookieFallback = self.account.hasOAuth
-                if self.needsReauth {
-                    self.reportReauthNeeded()
-                } else {
-                    self.reauthNotified = false
-                }
+                if self.needsReauth { self.reportReauthNeeded() }
                 self.fetchUsageViaCookie(cookie)
 
             case .needsReauth(let reason):
@@ -1605,6 +1598,11 @@ class UsageManager: ObservableObject {
                     return
                 }
 
+                // The token worked, so the grant is live. This is the only
+                // place the badge and the notification latch clear on a fetch.
+                self.needsReauth = false
+                self.usingCookieFallback = false
+                self.reauthNotified = false
                 self.parseUsageData(data)
                 self.updateStatusBar()
             }

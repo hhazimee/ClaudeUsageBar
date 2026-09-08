@@ -195,6 +195,44 @@ struct CredentialProviderTests {
         #expect(await await_(provider, UUID()) == .notConfigured)
     }
 
+    @Test func mutateEditsOneFieldAndLeavesTheRest() throws {
+        let store = makeStore(), id = UUID()
+        defer { store.delete(id) }
+        try store.save(StoredCredential(oauth: OAuthTokens(accessToken: "at"),
+                                        cookie: "first"), for: id)
+
+        let provider = CredentialProvider(store: store, client: FakeRefresher(), now: { self.now })
+        try provider.mutate(id) { $0.cookie = "second" }
+        #expect(store.load(id)?.cookie == "second")
+        #expect(store.load(id)?.oauth?.accessToken == "at")
+
+        // Emptying the credential removes the item rather than leaving a husk.
+        try provider.mutate(id) { $0.cookie = nil; $0.oauth = nil }
+        #expect(store.load(id) == nil)
+    }
+
+    @Test func aCookieSavedDuringARefreshDoesNotLoseTheRenewedToken() async throws {
+        let store = makeStore(), id = UUID(), refresher = FakeRefresher()
+        defer { store.delete(id) }
+        refresher.holdUntilReleased = true
+        refresher.result = .success(try makeTokenResponse(accessToken: "renewed"))
+        try store.save(StoredCredential(oauth: OAuthTokens(
+            accessToken: "stale", refreshToken: "rt",
+            expiresAt: now.addingTimeInterval(60))), for: id)
+
+        let provider = CredentialProvider(store: store, client: refresher, now: { self.now })
+        async let outcome = await_(provider, id)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        try provider.mutate(id) { $0.cookie = "sk-ant-sid-example" }
+        refresher.release()
+
+        #expect(await outcome == .token("renewed"))
+        // Both writes survive. A read-then-write across two queue hops would
+        // have put back a snapshot taken before the refresh committed.
+        #expect(store.load(id)?.oauth?.accessToken == "renewed")
+        #expect(store.load(id)?.cookie == "sk-ant-sid-example")
+    }
+
     @Test func signOutClearsTheTokensAndKeepsTheCookie() async throws {
         let store = makeStore(), id = UUID()
         defer { store.delete(id) }

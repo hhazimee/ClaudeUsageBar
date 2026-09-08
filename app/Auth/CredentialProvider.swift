@@ -67,7 +67,6 @@ public final class CredentialProvider {
             self.client.refresh(refreshToken: refreshToken) { result in
                 self.queue.async {
                     let outcome = self.apply(result,
-                                             to: stored,
                                              previousRefreshToken: refreshToken,
                                              id: id)
                     let waiters = self.waiting.removeValue(forKey: id) ?? []
@@ -94,18 +93,26 @@ public final class CredentialProvider {
     }
 
     private func apply(_ result: Result<TokenResponse, OAuthError>,
-                       to stored: StoredCredential,
                        previousRefreshToken: String,
                        id: UUID) -> CredentialOutcome {
+        // Re-read rather than trust the snapshot the refresh started with: a
+        // sign-out or a cookie paste can land while the refresh is in
+        // flight, and writing the renewed grant over that would silently
+        // undo it.
+        let current = store.load(id) ?? StoredCredential()
+
         switch result {
         case .success(let response):
+            guard current.oauth != nil else {
+                return fallback(current, reason: "signed out during refresh")
+            }
             var renewed = response.tokens(now: now())
             // The refresh response rarely carries an account, so keep the
             // previous email unless this one actually supplied a new value.
-            if renewed.email == nil { renewed.email = stored.oauth?.email }
+            if renewed.email == nil { renewed.email = current.oauth?.email }
             if renewed.refreshToken == nil { renewed.refreshToken = previousRefreshToken }
 
-            var updated = stored
+            var updated = current
             updated.oauth = renewed
             do {
                 // The write is the commit point. If it fails, the old token is
@@ -117,7 +124,7 @@ public final class CredentialProvider {
             return .token(renewed.accessToken)
 
         case .failure(let error) where error.isAuthFailure:
-            return fallback(stored, reason: "sign-in expired")
+            return fallback(current, reason: "sign-in expired")
 
         case .failure(let error):
             return .unavailable("\(error)")
@@ -126,6 +133,7 @@ public final class CredentialProvider {
 
     private func fallback(_ stored: StoredCredential, reason: String) -> CredentialOutcome {
         if let cookie = stored.cookie, !cookie.isEmpty { return .cookie(cookie) }
+        if stored.isEmpty { return .notConfigured }
         return .needsReauth(reason)
     }
 }

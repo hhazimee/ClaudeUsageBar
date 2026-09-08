@@ -121,6 +121,25 @@ struct CredentialProviderTests {
         #expect(refresher.calls == 1)
     }
 
+    @Test func signingOutDuringARefreshIsNotReverted() async throws {
+        let store = makeStore(), id = UUID(), refresher = FakeRefresher()
+        defer { store.delete(id) }
+        refresher.holdUntilReleased = true
+        refresher.result = .success(try makeTokenResponse(accessToken: "renewed"))
+        try store.save(StoredCredential(oauth: OAuthTokens(
+            accessToken: "stale", refreshToken: "rt",
+            expiresAt: now.addingTimeInterval(60))), for: id)
+
+        let provider = CredentialProvider(store: store, client: refresher, now: { self.now })
+        async let outcome = await_(provider, id)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        provider.signOut(id)
+        refresher.release()
+
+        #expect(await outcome == .notConfigured)
+        #expect(store.load(id)?.oauth == nil)
+    }
+
     @Test func aRejectedRefreshFallsBackToTheCookie() async throws {
         let store = makeStore(), id = UUID(), refresher = FakeRefresher()
         defer { store.delete(id) }

@@ -1,10 +1,10 @@
 {
-  "version": "1.2.1",
-  "title": "Important: v1.1 will stop running soon",
-  "description": "Your version of ClaudeUsageBar is outdated. Download v1.2 to keep tracking your Claude usage and service status. Free, takes 10 seconds.",
+  "version": "1.3.5",
+  "title": "New time format: \"Resets in 5d 23h\" + pacing",
+  "description": "Reset times now show as a countdown instead of a date, and your limit resets show when they expire. Also new: your Claude session credits, and an optional pace marker to see if you're on track. Prefer the date format? Switch back in Settings > Reset times.",
   "buttons": [
     {
-      "label": "Update now",
+      "label": "Download latest",
       "url": "https://github.com/Artzainnn/ClaudeUsageBar/releases/latest/download/ClaudeUsageBar-Installer.dmg",
       "style": "primary"
     }

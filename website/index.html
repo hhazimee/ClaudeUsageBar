@@ -43,6 +43,9 @@
       /* Twin brand (CodexUsageBar) for the cross-promo banner */
       --codex-green: #10a37f;
       --codex-green-dark: #0c8266;
+      /* Building It My Way accent, for the founder-journey banner */
+      --bimw-orange: #ef5a23;
+      --bimw-orange-dark: #cb5a22;
       --bg-dark: #0d0d0f;
       --bg-card: #18181b;
       --bg-card-hover: #1f1f23;
@@ -229,7 +232,7 @@
       justify-content: center;
       gap: 8px;
       padding: 0 16px;
-      background: linear-gradient(90deg, var(--codex-green), var(--codex-green-dark));
+      background: linear-gradient(90deg, var(--bimw-orange), var(--bimw-orange-dark));
       color: #ffffff;
       font-size: 13.5px;
       font-weight: 600;
@@ -557,6 +560,7 @@
       padding: 16px;
       min-width: 320px;
       box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+      text-align: left;
     }
 
     .usage-popup-title {
@@ -620,6 +624,23 @@
     .usage-section-percent {
       font-size: 11px;
       color: var(--text-muted);
+    }
+
+    .usage-manage {
+      font-size: 11px;
+      font-weight: 600;
+      color: #0a84ff;
+    }
+
+    .usage-credits {
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .usage-reset-note {
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin: -4px 0 14px;
     }
 
     .usage-status-row {
@@ -859,26 +880,6 @@
       fill: currentColor;
     }
 
-    .coffee-link {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--claude-orange);
-      text-decoration: none;
-      font-size: 15px;
-      font-weight: 500;
-      padding: 10px 20px;
-      background: rgba(218, 119, 86, 0.1);
-      border: 1px solid rgba(218, 119, 86, 0.2);
-      border-radius: 10px;
-      transition: all 0.3s;
-    }
-
-    .coffee-link:hover {
-      background: rgba(218, 119, 86, 0.15);
-      border-color: rgba(218, 119, 86, 0.3);
-      transform: translateY(-2px);
-    }
 
     /* Other Products */
     .other-products {
@@ -956,6 +957,21 @@
       font-size: 13px;
       color: var(--text-muted);
       line-height: 1.4;
+    }
+
+    .product-tag {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 2px 6px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 6px;
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      vertical-align: middle;
     }
 
     /* FAQ Section */
@@ -1150,10 +1166,10 @@
 </head>
 <body style="background-color: #0d0d0f;">
 
-  <!-- Cross-promo banner -->
-  <a href="https://codexusagebar.com?utm_source=claudeusagebar&utm_medium=website&utm_campaign=cross_promo" target="_blank" class="announce-bar" data-fast-goal="cross_promo">
-    <span class="announce-bar-tag">ALSO</span>
-    Using Codex too? Get CodexUsageBar<span class="announce-bar-cta"> <span class="announce-bar-sep">&bull;</span> Free</span>
+  <!-- Founder-journey banner (links through /founder for tracking + one destination) -->
+  <a href="/founder" target="_blank" class="announce-bar" data-fast-goal="founder_banner">
+    <span class="announce-bar-tag">WATCH</span>
+    🎥 Watch the journey behind ClaudeUsageBar founder<span class="announce-bar-cta"> <span class="announce-bar-sep">&bull;</span> Watch on YouTube</span>
   </a>
   <div class="ambient"></div>
 
@@ -1192,7 +1208,6 @@
       <svg style="width: 16px; height: 16px; vertical-align: middle; margin-right: 6px; fill: currentColor;" viewBox="0 0 24 24"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
       Twitter
     </a>
-    <a href="https://donate.stripe.com/3cIcN5b5H7Q8ay8bIDfIs02" target="_blank" data-fast-goal="buy_coffee">☕ Buy Dev a Coffee</a>
     <a href="https://github.com/Artzainnn/ClaudeUsageBar/releases/latest/download/ClaudeUsageBar-Installer.dmg" class="mobile-cta" data-fast-goal="download_macos">Download for macOS</a>
   </div>
 
@@ -1346,13 +1361,12 @@
               <div class="usage-section">
                 <div class="usage-section-header">
                   <span class="usage-section-label">Extra usage</span>
-                  <span class="usage-section-reset">Resets Aug 1</span>
+                  <span class="usage-manage">Manage →</span>
                 </div>
-                <div class="usage-progress">
-                  <div class="usage-progress-bar" id="extraBar" style="width: 34%;"></div>
-                </div>
-                <span class="usage-section-percent" id="extraPercent">$8.50 of $25.00 · 34%</span>
+                <div class="usage-credits">USD 4.20 free credits left</div>
               </div>
+
+              <div class="usage-reset-note" id="resetNote">1 usage-limit reset available until Nov 1</div>
 
               <div class="usage-status-row" id="statusRow">
                 <span class="usage-status-dot green" id="statusDot"></span>
@@ -1521,21 +1535,13 @@
           <span class="product-desc">Instantly boost AIO, SEO, Social Proof</span>
         </div>
       </a>
-      <a href="https://tickercompare.com?utm_source=claudeusagebar&utm_medium=website&utm_campaign=cross_promo" target="_blank" class="product-card">
+      <a href="https://thelabscompany.com/?utm_source=claudeusagebar&utm_medium=website&utm_campaign=cross_promo" target="_blank" class="product-card" data-fast-goal="labs_card">
         <div class="product-icon">
-          <svg width="44" height="44" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="TickerCompare logo">
-            <defs><linearGradient id="tc-logo-g" x1="0" y1="0" x2="48" y2="48" gradientUnits="userSpaceOnUse"><stop stop-color="#2f2f31"/><stop offset="1" stop-color="#1c1c1e"/></linearGradient></defs>
-            <rect width="48" height="48" rx="11" fill="url(#tc-logo-g)"/>
-            <g fill="#ef5a23">
-              <rect x="11" y="25" width="6" height="11" rx="1.6" opacity="0.65"/>
-              <rect x="21" y="19" width="6" height="17" rx="1.6" opacity="0.82"/>
-              <rect x="31" y="12" width="6" height="24" rx="1.6"/>
-            </g>
-          </svg>
+          <img src="/labs-logo.png" width="44" height="44" alt=".labs logo">
         </div>
         <div class="product-info">
-          <span class="product-name">TickerCompare</span>
-          <span class="product-desc">Compare UCITS ETFs &amp; stocks</span>
+          <span class="product-name">.labs <span class="product-tag">Waitlist</span></span>
+          <span class="product-desc">Get yourname.labs, the new domain for builders.</span>
         </div>
       </a>
     </div>
@@ -1544,15 +1550,13 @@
   <section class="creator">
     <div class="creator-content">
       <span class="creator-label">Made with love by</span>
-      <a href="https://x.com/buildingitmyway" target="_blank" class="creator-link" data-fast-goal="click_twitter">
-        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-          <path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/>
+      <a href="https://buildingitmyway.com?utm_source=claudeusagebar&utm_medium=website&utm_campaign=cross_promo" target="_blank" class="creator-link" data-fast-goal="click_bimw">
+        <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg" aria-label="Building It My Way logo">
+          <rect width="100" height="100" rx="22" fill="#0a0a0b"/>
+          <text x="26" y="75" font-family="Arial Black, Arial Narrow, Arial, sans-serif" font-weight="900" font-size="78" fill="#f7f6f3">B</text>
+          <circle cx="80" cy="69" r="9" fill="#ff5c35"/>
         </svg>
         Maxime B.
-      </a>
-      <a href="https://donate.stripe.com/3cIcN5b5H7Q8ay8bIDfIs02" target="_blank" class="coffee-link" data-fast-goal="buy_coffee">
-        <span>☕</span>
-        Buy Dev a Coffee
       </a>
     </div>
   </section>
@@ -1562,6 +1566,7 @@
       <div class="footer-links">
         <a href="/status" class="footer-status-pill loading" data-nav-status><span class="footer-status-dot loading" data-nav-status></span><span>Claude Status</span></a>
         <a href="/blog/">Blog</a>
+        <a href="/updates">Updates</a>
         <a href="https://github.com/Artzainnn/ClaudeUsageBar" target="_blank">GitHub</a>
         <a href="https://github.com/Artzainnn/ClaudeUsageBar#-features" target="_blank">Privacy</a>
         <a href="https://github.com/Artzainnn/ClaudeUsageBar/blob/main/LICENSE" target="_blank">License</a>
@@ -1622,6 +1627,14 @@
       // Update last updated time
       updateLastUpdatedTime();
     }
+
+    // Demo reset expiry: always two weeks out so it never reads as expired
+    (function () {
+      const note = document.getElementById('resetNote');
+      if (!note) return;
+      const d = new Date(Date.now() + 14 * 864e5);
+      note.textContent = '1 usage-limit reset available until ' + d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    })();
 
     // Toggle usage popup with Cmd+U
     function toggleUsagePopup() {

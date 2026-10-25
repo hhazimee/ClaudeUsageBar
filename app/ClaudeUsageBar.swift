@@ -16,11 +16,82 @@ extension Color {
     })
 }
 
+/// Compact choice control with the accent-blue selection of the app's prominent
+/// buttons. Native segmented pickers only tint while their window is key, which
+/// the popover never is, so they read as flat gray.
+struct ChoicePills: View {
+    @Binding var selection: String
+    let options: [(label: String, tag: String)]
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(options, id: \.tag) { option in
+                let selected = selection == option.tag
+                Button(action: { selection = option.tag }) {
+                    Text(option.label)
+                        .font(.caption)
+                        .fontWeight(selected ? .semibold : .regular)
+                        .foregroundColor(selected ? .white : Color.secondaryText)
+                        .frame(minWidth: 64)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 5).fill(selected ? Color.accentColor : Color.clear))
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(2)
+        .background(RoundedRectangle(cornerRadius: 7).fill(Color.secondary.opacity(0.15)))
+        .fixedSize()
+    }
+}
+
+/// A banked usage-limit reset the user can trigger on claude.ai.
+struct ResetGrant: Equatable {
+    let title: String
+    let count: Int
+    let expiresAt: Date?
+}
+
+/// Banked resets as a plain line: count on the left, expiry aligned right.
+struct ResetRow: View {
+    let title: String
+    let detail: String?
+    let help: String
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            if let detail = detail {
+                Text(detail)
+            }
+        }
+        .font(.caption)
+        .foregroundColor(Color.secondaryText)
+        .help(help)
+    }
+}
+
+// Where usage "should" sit right now, given how far into the reset window we
+// are. The two fields travel together so a tick is never drawn without the
+// tooltip explaining it.
+struct PaceMarker {
+    let expected: Double   // 0...1
+    let tooltip: String
+}
+
 // Deterministic usage bar: the native linear ProgressView ignores .tint() in
 // light (aqua) and vibrant rendering and falls back to accent blue.
 struct UsageBar: View {
     let value: Double
     let color: Color
+    var pace: PaceMarker? = nil
+
+    @State private var isHovering = false
+
+    private let tickWidth: CGFloat = 1.5
 
     var body: some View {
         GeometryReader { geo in
@@ -29,9 +100,54 @@ struct UsageBar: View {
                 Capsule()
                     .fill(color)
                     .frame(width: max(0, min(1, value)) * geo.size.width)
+                // Neutral so it stays legible over both the fill and the track.
+                if let pace = pace {
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.7))
+                        .frame(width: tickWidth)
+                        .offset(x: max(0, min(1, pace.expected)) * geo.size.width - tickWidth / 2)
+                }
+            }
+            // Trims a tick near either end against the rounded cap.
+            .clipShape(Capsule())
+            // After the clip so the bubble isn't trimmed, and pinned to the
+            // leading edge so it can't run off the right of the popup.
+            .overlay(alignment: .topLeading) {
+                if let pace = pace, isHovering {
+                    PaceTooltip(text: pace.tooltip)
+                        .offset(y: -24)
+                }
             }
         }
         .frame(height: 6)
+        // Hover, not .help(): the popover is never the key window, so AppKit
+        // tooltips don't fire. Tracked on the whole bar; the tick is too thin to aim at.
+        .onHover { isHovering = $0 }
+    }
+}
+
+// Tooltip bubble for the pace marker. Solid backing: a material over the
+// popover's own translucency reads as muddy.
+struct PaceTooltip: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption2)
+            .foregroundColor(Color.primary)
+            .fixedSize()
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color(nsColor: .controlBackgroundColor))
+                    .shadow(color: .black.opacity(0.28), radius: 3, y: 1)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(Color.primary.opacity(0.12), lineWidth: 0.5)
+            )
+            .allowsHitTesting(false)
     }
 }
 
@@ -792,6 +908,7 @@ enum AccountStore {
             "status_notifications_enabled",
             "shortcut_enabled",
             "show_countdown",
+            "pace_marker_enabled",
             "appearance_mode",
             "tracked_component_ids"
         ]
@@ -834,6 +951,9 @@ class AccountsController: ObservableObject {
     /// Show time remaining instead of clock times, and add a countdown to the
     /// menu bar. Off by default: it roughly doubles the menu bar width.
     @Published var showCountdown: Bool = false
+
+    /// Tick on each bar marking where usage should be by now. Off by default.
+    @Published var paceMarkerEnabled: Bool = false
 
     weak var delegate: AppDelegate?
 
@@ -953,6 +1073,7 @@ class AccountsController: ObservableObject {
         }
 
         showCountdown = UserDefaults.standard.bool(forKey: "show_countdown")
+        paceMarkerEnabled = UserDefaults.standard.bool(forKey: "pace_marker_enabled")
     }
 
     /// Re-renders the menu bar and any open popup so countdowns advance.
@@ -968,6 +1089,7 @@ class AccountsController: ObservableObject {
         UserDefaults.standard.set(openAtLogin, forKey: "open_at_login")
         UserDefaults.standard.set(shortcutEnabled, forKey: "shortcut_enabled")
         UserDefaults.standard.set(showCountdown, forKey: "show_countdown")
+        UserDefaults.standard.set(paceMarkerEnabled, forKey: "pace_marker_enabled")
         UserDefaults.standard.synchronize()
     }
 
@@ -1012,6 +1134,12 @@ class UsageManager: ObservableObject {
     @Published var extraLimitMinor: Int = 0
     @Published var extraResetsAt: Date?
     @Published var freeCreditsMinor: Int = 0   // remaining free/promo credits (/prepaid/credits)
+    // Banked usage-limit resets the user can trigger on claude.ai. Read-only here.
+    @Published var limitResetGrants: [ResetGrant] = []
+    // Dollar allowance claude.ai calls `iguana_necktie`. Limit 0 hides the row.
+    @Published var sessionCreditsUsed: Double = 0
+    @Published var sessionCreditsLimit: Double = 0
+    @Published var sessionCreditsResetsAt: Date?
     @Published var creditCurrency: String = "USD"
     @Published var hasCreditUsage: Bool = false
     @Published var sessionResetsAt: Date?
@@ -1311,6 +1439,10 @@ class UsageManager: ObservableObject {
         extraLimitMinor = 0
         extraResetsAt = nil
         freeCreditsMinor = 0
+        limitResetGrants = []
+        sessionCreditsUsed = 0
+        sessionCreditsLimit = 0
+        sessionCreditsResetsAt = nil
         hasCreditUsage = false
         hasFetchedData = false
         hasWeeklySonnet = false
@@ -1694,7 +1826,51 @@ class UsageManager: ObservableObject {
             self.fetchUsageWithOrgId(orgId, cookie: cookie)
             self.fetchExtraUsage(orgId, cookie: cookie)
             self.fetchFreeCredits(orgId, cookie: cookie)
+            self.fetchLimitResets(orgId, cookie: cookie)
         }
+    }
+
+    // Usage-limit resets still available. claude.ai's Settings > Usage reads the
+    // same `cedar_ember` object from /usage with `cedar_ember=1`; we only GET it.
+    func fetchLimitResets(_ orgId: String, cookie: String) {
+        guard let url = URL(string: "https://claude.ai/api/organizations/\(orgId)/usage?cedar_ember=1&skip_spend=1") else { return }
+        let request = makeRequest(url, cookie: cookie)
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            DispatchQueue.main.async {
+                guard let self = self,
+                      let http = response as? HTTPURLResponse, http.statusCode == 200,
+                      let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+                self.limitResetGrants = Self.parseLimitResets(json["cedar_ember"])
+                NSLog("🔄 Limit resets available: \(self.limitResetsLeft)")
+            }
+        }.resume()
+    }
+
+    var limitResetsLeft: Int { limitResetGrants.reduce(0) { $0 + $1.count } }
+
+    /// Grants with resets still usable (not paused, inside their window).
+    static func parseLimitResets(_ raw: Any?, now: Date = Date()) -> [ResetGrant] {
+        guard let obj = raw as? [String: Any],
+              (obj["eligible"] as? Bool) == true,
+              let grants = obj["grants"] as? [[String: Any]] else { return [] }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let isoNoFrac = ISO8601DateFormatter()
+        func date(_ v: Any?) -> Date? {
+            guard let s = v as? String else { return nil }
+            return iso.date(from: s) ?? isoNoFrac.date(from: s)
+        }
+        var out: [ResetGrant] = []
+        for g in grants {
+            let left = (g["resets_left"] as? Int) ?? 0
+            guard left > 0, (g["paused"] as? Bool) != true,
+                  let end = date(g["ends_at"]), end > now else { continue }
+            if let start = date(g["starts_at"]), start > now { continue }
+            out.append(ResetGrant(title: (g["label"] as? String) ?? "Usage-limit reset", count: left, expiresAt: end))
+        }
+        return out
     }
 
     // Remaining free/promo credits (balance) from /prepaid/credits.
@@ -1830,6 +2006,18 @@ class UsageManager: ObservableObject {
                         NSLog("❌ Failed to parse session reset time")
                     }
                 }
+            }
+
+            if let credits = json["iguana_necktie"] as? [String: Any],
+               let limit = (credits["limit_dollars"] as? NSNumber)?.doubleValue, limit > 0 {
+                sessionCreditsLimit = limit
+                sessionCreditsUsed = (credits["used_dollars"] as? NSNumber)?.doubleValue ?? 0
+                let resets = credits["resets_at"] as? String
+                sessionCreditsResetsAt = resets.flatMap { iso8601Formatter.date(from: $0) ?? ISO8601DateFormatter().date(from: $0) }
+            } else {
+                sessionCreditsLimit = 0
+                sessionCreditsUsed = 0
+                sessionCreditsResetsAt = nil
             }
 
             if let sevenDay = json["seven_day"] as? [String: Any] {
@@ -1999,6 +2187,31 @@ class UsageManager: ObservableObject {
         weeklyPercentage = Double(weeklyUsage) / Double(weeklyLimit)
         weeklySonnetPercentage = Double(weeklySonnetUsage) / Double(weeklySonnetLimit)
         weeklyFablePercentage = Double(weeklyFableUsage) / Double(weeklyFableLimit)
+    }
+}
+
+// MARK: - Pace
+
+// Fixed window lengths per limit type. Flat seconds, not calendar units, so a
+// DST change inside the window can't shift the start by an hour.
+enum PaceWindow {
+    static let session: TimeInterval = 5 * 3600
+    static let weekly: TimeInterval = 7 * 24 * 3600
+}
+
+struct Pace {
+    let expected: Double      // 0...1, where the fill "should" be by now
+    let elapsed: TimeInterval
+
+    // The API only reports resets_at, but the window length is fixed, so the
+    // start is exact. Nil when nothing honest can be drawn: no data, the reset
+    // is already due (stale fetch), or the window hasn't opened.
+    init?(resetsAt: Date?, window: TimeInterval, now: Date = Date()) {
+        guard let resetsAt = resetsAt, window > 0, now < resetsAt else { return nil }
+        let elapsed = now.timeIntervalSince(resetsAt.addingTimeInterval(-window))
+        guard elapsed >= 0 else { return nil }
+        self.expected = min(1, max(0, elapsed / window))
+        self.elapsed = elapsed
     }
 }
 
@@ -2334,6 +2547,19 @@ class UpdateManager: ObservableObject {
             }()
 
             DispatchQueue.main.async {
+                // First-seen times decide which banner wins when both are live.
+                let d = UserDefaults.standard
+                let now = Date().timeIntervalSince1970
+                if let update = updatePayload, self.isNewer(remote: update.version, than: self.currentVersion),
+                   d.string(forKey: "update_seen_version") != update.version {
+                    d.set(update.version, forKey: "update_seen_version")
+                    d.set(now, forKey: "update_seen_at")
+                }
+                if let ann = announcementPayload, d.string(forKey: "message_seen_id") != ann.id {
+                    d.set(ann.id, forKey: "message_seen_id")
+                    d.set(now, forKey: "message_seen_at")
+                }
+
                 // Version-update channel
                 if let update = updatePayload, self.isNewer(remote: update.version, than: self.currentVersion) {
                     if self.available != update {
@@ -2377,9 +2603,31 @@ class UpdateManager: ObservableObject {
         }.resume()
     }
 
+    enum Banner { case none, message, update }
+
+    /// With a message and an update both live, show the one first seen most
+    /// recently. Ties go to the update.
+    static func pickBanner(hasMessage: Bool, hasUpdate: Bool,
+                           messageSeenAt: Double, updateSeenAt: Double) -> Banner {
+        switch (hasMessage, hasUpdate) {
+        case (false, false): return .none
+        case (true, false): return .message
+        case (false, true): return .update
+        case (true, true): return updateSeenAt >= messageSeenAt ? .update : .message
+        }
+    }
+
+    var visibleBanner: Banner {
+        let d = UserDefaults.standard
+        return Self.pickBanner(hasMessage: announcement != nil,
+                               hasUpdate: available != nil && !isCurrentDismissed,
+                               messageSeenAt: d.double(forKey: "message_seen_at"),
+                               updateSeenAt: d.double(forKey: "update_seen_at"))
+    }
+
     func dismissCurrent() {
-        // Announcement takes priority in the UI, so dismiss it first if present.
-        if let id = announcement?.id {
+        // Dismiss the banner on screen; the other one, if any, shows next.
+        if visibleBanner == .message, let id = announcement?.id {
             UserDefaults.standard.set(id, forKey: "dismissed_message_id")
             announcement = nil
             return
@@ -2693,7 +2941,7 @@ struct UsageView: View {
 
             // Free-form message banner (author-controlled). Takes priority over
             // the version-update banner when both are present.
-            if let ann = updateManager.announcement {
+            if updateManager.visibleBanner == .message, let ann = updateManager.announcement {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 6) {
                         if let heading = ann.heading, !heading.isEmpty {
@@ -2732,9 +2980,9 @@ struct UsageView: View {
                 .cornerRadius(6)
             }
 
-            // App update banner (version-based). Hidden while a message banner shows.
-            if updateManager.announcement == nil,
-               let update = updateManager.available, !updateManager.isCurrentDismissed {
+            // App update banner (version-based). Shares the slot with the message
+            // card; the more recently published of the two is shown.
+            if updateManager.visibleBanner == .update, let update = updateManager.available {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 6) {
                         Text("⬆️")
@@ -2964,6 +3212,24 @@ struct UsageView: View {
                     .controlSize(.mini)
 
                     Toggle(isOn: Binding(
+                        get: { accounts.paceMarkerEnabled },
+                        set: { newValue in
+                            accounts.paceMarkerEnabled = newValue
+                            accounts.saveSettings()
+                        }
+                    )) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Show pace marker")
+                                .font(.caption)
+                            Text("Marks where usage should be by now")
+                                .font(.caption2)
+                                .foregroundColor(Color.secondaryText)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+
+                    Toggle(isOn: Binding(
                         get: { accounts.openAtLogin },
                         set: { newValue in
                             accounts.openAtLogin = newValue
@@ -3092,13 +3358,8 @@ struct UsageView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Appearance")
                             .font(.caption)
-                        Picker("Appearance", selection: $appearanceMode) {
-                            Text("System").tag("system")
-                            Text("Dark").tag("dark")
-                            Text("Light").tag("light")
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
+                        ChoicePills(selection: $appearanceMode,
+                                    options: [("System", "system"), ("Dark", "dark"), ("Light", "light")])
                         .onChange(of: appearanceMode) { _ in
                             (NSApplication.shared.delegate as? AppDelegate)?.applyAppearancePreference()
                         }
@@ -3249,6 +3510,56 @@ struct AccountUsageSection: View {
     @State private var showCookie: Bool = false
 
     private var account: Account { manager.account }
+
+    // MARK: - Reset and pace labels
+
+    /// Reset time in the chosen style, with the other style on hover.
+    private func resetLabel(_ date: Date, includeDate: Bool = true) -> some View {
+        let relative = accounts.showCountdown
+        return Text("Resets \(formatReset(date, includeDate: includeDate, relative: relative))")
+            .help("Resets \(formatReset(date, includeDate: includeDate, relative: !relative))")
+    }
+
+    /// Nil when the setting is off or the window data can't support a marker.
+    private func paceMarker(resetsAt: Date?, window: TimeInterval) -> PaceMarker? {
+        guard accounts.paceMarkerEnabled,
+              let pace = Pace(resetsAt: resetsAt, window: window) else { return nil }
+        let percent = Int((pace.expected * 100).rounded())
+        let elapsed = formatCountdown(to: Date().addingTimeInterval(pace.elapsed)) ?? "0m"
+        return PaceMarker(expected: pace.expected,
+                          tooltip: "On pace: \(percent)% by now · \(elapsed) in")
+    }
+
+    private func resetRow(_ grants: [ResetGrant]) -> some View {
+        let n = grants.reduce(0) { $0 + $1.count }
+        return ResetRow(title: "\(n) limit reset\(n == 1 ? "" : "s") available",
+                        detail: resetsExpiryText(grants),
+                        help: resetsHelp(grants))
+    }
+
+    /// "Expires in 6d 4h" or "Until Oct 22". With several expiry dates, the
+    /// soonest is what matters ("Next ...").
+    private func resetsExpiryText(_ grants: [ResetGrant]) -> String? {
+        let ends = grants.compactMap { $0.expiresAt }
+        guard let first = ends.min() else { return nil }
+        let next = Set(ends).count > 1 ? "Next " : ""
+        if !accounts.showCountdown {
+            // Last usable instant: an end at local midnight would read as the next day.
+            let f = DateFormatter(); f.dateFormat = "MMM d"
+            return "\(next.isEmpty ? "Until" : "Next until") \(f.string(from: first.addingTimeInterval(-1)))"
+        }
+        let left = formatCountdown(to: first).map { "in \($0)" } ?? "now"
+        return "\(next.isEmpty ? "Expires" : "Next expires") \(left)"
+    }
+
+    private func resetsHelp(_ grants: [ResetGrant]) -> String {
+        let f = DateFormatter(); f.dateFormat = "MMM d, h:mm a"
+        return grants.sorted { ($0.expiresAt ?? .distantFuture) < ($1.expiresAt ?? .distantFuture) }.map { g in
+            let count = g.count > 1 ? " (x\(g.count))" : ""
+            let when = g.expiresAt.map { "expires \(f.string(from: $0))" } ?? "no expiry"
+            return "\(g.title)\(count): \(when)"
+        }.joined(separator: "\n")
+    }
 
     // MARK: - Sign-in
 
@@ -3435,14 +3746,15 @@ struct AccountUsageSection: View {
                         .font(.subheadline)
                     Spacer()
                     if let resetTime = manager.sessionResetsAt {
-                        Text("Resets \(formatReset(resetTime, relative: accounts.showCountdown))")
+                        resetLabel(resetTime, includeDate: false)
                             .font(.caption)
                             .foregroundColor(Color.secondaryText)
                     }
                 }
 
                 UsageBar(value: manager.sessionPercentage,
-                         color: colorForPercentage(manager.sessionPercentage))
+                         color: colorForPercentage(manager.sessionPercentage),
+                         pace: paceMarker(resetsAt: manager.sessionResetsAt, window: PaceWindow.session))
 
                 Text("\(Int(manager.sessionPercentage * 100))% used")
                     .font(.caption)
@@ -3456,14 +3768,15 @@ struct AccountUsageSection: View {
                         .font(.subheadline)
                     Spacer()
                     if let resetTime = manager.weeklyResetsAt {
-                        Text("Resets \(formatReset(resetTime, includeDate: true, relative: accounts.showCountdown))")
+                        resetLabel(resetTime)
                             .font(.caption)
                             .foregroundColor(Color.secondaryText)
                     }
                 }
 
                 UsageBar(value: manager.weeklyPercentage,
-                         color: colorForPercentage(manager.weeklyPercentage))
+                         color: colorForPercentage(manager.weeklyPercentage),
+                         pace: paceMarker(resetsAt: manager.weeklyResetsAt, window: PaceWindow.weekly))
 
                 Text("\(Int(manager.weeklyPercentage * 100))% used")
                     .font(.caption)
@@ -3478,14 +3791,15 @@ struct AccountUsageSection: View {
                             .font(.subheadline)
                         Spacer()
                         if let resetTime = manager.weeklySonnetResetsAt {
-                            Text("Resets \(formatReset(resetTime, includeDate: true, relative: accounts.showCountdown))")
+                            resetLabel(resetTime)
                                 .font(.caption)
                                 .foregroundColor(Color.secondaryText)
                         }
                     }
 
                     UsageBar(value: manager.weeklySonnetPercentage,
-                             color: colorForPercentage(manager.weeklySonnetPercentage))
+                             color: colorForPercentage(manager.weeklySonnetPercentage),
+                             pace: paceMarker(resetsAt: manager.weeklySonnetResetsAt, window: PaceWindow.weekly))
 
                     Text("\(Int(manager.weeklySonnetPercentage * 100))% used")
                         .font(.caption)
@@ -3502,16 +3816,42 @@ struct AccountUsageSection: View {
                             .font(.subheadline)
                         Spacer()
                         if let resetTime = manager.weeklyFableResetsAt {
-                            Text("Resets \(formatReset(resetTime, includeDate: true, relative: accounts.showCountdown))")
+                            resetLabel(resetTime)
                                 .font(.caption)
                                 .foregroundColor(Color.secondaryText)
                         }
                     }
 
                     UsageBar(value: manager.weeklyFablePercentage,
-                             color: colorForPercentage(manager.weeklyFablePercentage))
+                             color: colorForPercentage(manager.weeklyFablePercentage),
+                             pace: paceMarker(resetsAt: manager.weeklyFableResetsAt, window: PaceWindow.weekly))
 
                     Text("\(Int(manager.weeklyFablePercentage * 100))% used")
+                        .font(.caption)
+                        .foregroundColor(Color.secondaryText)
+                }
+            }
+
+            // Claude session credits: shown from the first cent used.
+            if manager.sessionCreditsLimit > 0, manager.sessionCreditsUsed >= 0.01 {
+                let used = manager.sessionCreditsUsed
+                let limit = manager.sessionCreditsLimit
+                let money: (Double) -> String = { v in
+                    v == v.rounded() ? String(format: "$%.0f", v) : String(format: "$%.2f", v)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Claude session credits")
+                            .font(.subheadline)
+                        Spacer()
+                        if let resetTime = manager.sessionCreditsResetsAt {
+                            resetLabel(resetTime)
+                        }
+                    }
+
+                    UsageBar(value: used / limit, color: colorForPercentage(used / limit))
+
+                    Text("\(money(max(0, limit - used))) of \(money(limit)) left")
                         .font(.caption)
                         .foregroundColor(Color.secondaryText)
                 }
@@ -3585,21 +3925,16 @@ struct AccountUsageSection: View {
                 }
             }
 
-            // Discreet reassurance line naming whichever of Fable / extra usage
-            // is not being consumed (nothing shown when both are active).
-            if manager.hasFetchedData {
-                let fableActive = manager.hasWeeklyFable && manager.weeklyFableUsage >= 1
-                let extraActive = manager.hasCreditUsage || manager.freeCreditsMinor > 0
-                if !fableActive || !extraActive {
-                    Text(
-                        !fableActive && !extraActive ? "No Fable or extra usage"
-                        : !extraActive ? "No extra usage"
-                        : "No Fable usage"
-                    )
+            // Available limit resets when there are any, else "No extra usage"
+            // when none is being consumed.
+            if manager.hasFetchedData && manager.limitResetsLeft > 0 {
+                resetRow(manager.limitResetGrants)
+            } else if manager.hasFetchedData
+                        && !(manager.hasCreditUsage || manager.freeCreditsMinor > 0) {
+                Text("No extra usage")
                     .font(.caption2)
                     .foregroundColor(Color.secondaryText)
                     .opacity(0.6)
-                }
             }
             }
             // Which credential is actually being used, so a silent fallback

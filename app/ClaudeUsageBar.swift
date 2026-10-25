@@ -2452,7 +2452,9 @@ class CustomTextField: NSTextField {
 // Custom TextView that ensures keyboard commands work
 class PasteableNSTextView: NSTextView {
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        if event.modifierFlags.contains(.command) {
+        // AppKit offers key equivalents to every view in the window, so only
+        // the focused field may act on them, or the first one drawn wins.
+        if event.modifierFlags.contains(.command), window?.firstResponder === self {
             switch event.charactersIgnoringModifiers {
             case "v": // Paste
                 paste(nil)

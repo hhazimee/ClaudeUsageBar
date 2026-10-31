@@ -1115,7 +1115,7 @@ class AccountsController: ObservableObject {
     func sendTestNotification() {
         Notifier.send(
             title: "Claude Usage Alert",
-            body: "Test notification - You've reached 75% of your 5-hour session limit"
+            body: "Test notification - You've reached 75% of your 7-day weekly limit"
         )
     }
 }
@@ -1123,6 +1123,8 @@ class AccountsController: ObservableObject {
 class UsageManager: ObservableObject {
     @Published var sessionUsage: Int = 0
     @Published var sessionLimit: Int = 100
+    // False on plans with no 5-hour limit, such as Ultra.
+    @Published var hasSessionLimit: Bool = false
     @Published var weeklyUsage: Int = 0
     @Published var weeklyLimit: Int = 100
     @Published var weeklySonnetUsage: Int = 0
@@ -1361,6 +1363,7 @@ class UsageManager: ObservableObject {
     var bindingLimit: (kind: LimitKind, percent: Int) {
         let session = sessionPercent
         let weekly = weeklyPercent
+        guard hasSessionLimit else { return (.weekly, weekly) }
         if weekly >= Self.weeklyTakeoverPercent && weekly > session {
             return (.weekly, weekly)
         }
@@ -1427,6 +1430,7 @@ class UsageManager: ObservableObject {
         onAccountEdited?(account)
 
         // Reset all data
+        hasSessionLimit = false
         sessionUsage = 0
         weeklyUsage = 0
         weeklySonnetUsage = 0
@@ -1992,8 +1996,13 @@ class UsageManager: ObservableObject {
             iso8601Formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 
             // Parse the actual claude.ai response format
+            // Clear first so a limit that disappears leaves no stale figure.
+            hasSessionLimit = false
+            sessionUsage = 0
+            sessionResetsAt = nil
             if let fiveHour = json["five_hour"] as? [String: Any] {
                 if let sessionUtil = fiveHour["utilization"] as? Double {
+                    hasSessionLimit = true
                     sessionUsage = Int(sessionUtil)
                     sessionLimit = 100
                 }
@@ -3258,7 +3267,7 @@ struct UsageView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("Enable Usage Notifications")
                                     .font(.caption)
-                                Text("Get alerts at 25%, 50%, 75%,\nand 90% session usage")
+                                Text("Get alerts at 25%, 50%, 75%,\nand 90% usage")
                                     .font(.caption2)
                                     .foregroundColor(Color.secondaryText)
                                     .fixedSize(horizontal: false, vertical: true)
@@ -3740,6 +3749,7 @@ struct AccountUsageSection: View {
 
             // Session Usage
             if manager.hasFetchedData {
+            if manager.hasSessionLimit {
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text("Session (5 hour)")
@@ -3759,6 +3769,7 @@ struct AccountUsageSection: View {
                 Text("\(Int(manager.sessionPercentage * 100))% used")
                     .font(.caption)
                     .foregroundColor(Color.secondaryText)
+            }
             }
 
             // Weekly Usage

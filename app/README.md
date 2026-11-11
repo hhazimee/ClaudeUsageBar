@@ -6,6 +6,7 @@ A lightweight macOS menu bar app that displays your Claude.ai session and weekly
 
 ## ✨ Features
 
+- 📅 **Daily Allowance**: Share weekly usage evenly across the accounts you tick, with an alert when to switch
 - 🟢 **Real-time Usage Tracking**: Monitor weekly (7-day) usage, plus session (5-hour) usage on plans that still have it
 - 🎨 **Color-Coded Menu Bar Icon**: Visual indication of usage levels (green/yellow/red)
 - 🔔 **Smart Notifications**: Alerts at 25%, 50%, 75%, and 90% usage thresholds

@@ -37,6 +37,8 @@ fi
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     ClaudeUsageBar.swift \
     Auth/*.swift \
+    Budget/*.swift \
+    Views/*.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
@@ -46,6 +48,8 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     ClaudeUsageBar.swift \
     Auth/*.swift \
+    Budget/*.swift \
+    Views/*.swift \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \

@@ -698,6 +698,9 @@ struct Account: Codable, Identifiable, Equatable {
     /// cannot sign in to the login a first account already holds.
     var accountUUID: String? = nil
 
+    /// Counts toward the shared daily allowance.
+    var inDailyBudget: Bool = false
+
     // Legacy fields. Decoded so accounts saved before the keychain move can be
     // migrated, then blanked. Nothing reads them after `migrateSecretsToKeychain`.
     var cookie: String = ""
@@ -734,7 +737,7 @@ struct Account: Codable, Identifiable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, emoji, colorHex, hasOAuth, hasCookie, accountEmail, accountUUID
+        case id, name, emoji, colorHex, hasOAuth, hasCookie, accountEmail, accountUUID, inDailyBudget
         case cookie, oauthToken, keychainService, keychainAccount
     }
 
@@ -751,6 +754,7 @@ struct Account: Codable, Identifiable, Equatable {
         hasCookie = try container.decodeIfPresent(Bool.self, forKey: .hasCookie) ?? false
         accountEmail = try container.decodeIfPresent(String.self, forKey: .accountEmail)
         accountUUID = try container.decodeIfPresent(String.self, forKey: .accountUUID)
+        inDailyBudget = try container.decodeIfPresent(Bool.self, forKey: .inDailyBudget) ?? false
         cookie = try container.decodeIfPresent(String.self, forKey: .cookie) ?? ""
         oauthToken = try container.decodeIfPresent(String.self, forKey: .oauthToken)
         keychainService = try container.decodeIfPresent(String.self, forKey: .keychainService)
@@ -955,11 +959,25 @@ class AccountsController: ObservableObject {
     /// Tick on each bar marking where usage should be by now. Off by default.
     @Published var paceMarkerEnabled: Bool = false
 
+    @Published private(set) var dailyBudget = DailyBudget()
+    private static let dailyBudgetKey = "daily_budget"
+
+    @Published private(set) var usageHistory = UsageHistory()
+    private static let usageHistoryKey = "usage_history"
+
     weak var delegate: AppDelegate?
 
     init() {
         loadSettings()
         checkAccessibilityStatus()
+        if let data = UserDefaults.standard.data(forKey: Self.dailyBudgetKey),
+           let saved = try? JSONDecoder().decode(DailyBudget.self, from: data) {
+            dailyBudget = saved
+        }
+        if let data = UserDefaults.standard.data(forKey: Self.usageHistoryKey),
+           let saved = try? JSONDecoder().decode(UsageHistory.self, from: data) {
+            usageHistory = saved
+        }
         managers = AccountStore.load().map(makeManager)
     }
 
@@ -968,7 +986,12 @@ class AccountsController: ObservableObject {
     private func makeManager(_ account: Account) -> UsageManager {
         let manager = UsageManager(account: account, credentials: credentials)
         manager.notificationsEnabled = { [weak self] in self?.usageNotificationsEnabled ?? true }
-        manager.onUsageChanged = { [weak self] in self?.refreshStatusBar() }
+        manager.onUsageChanged = { [weak self] in
+            self?.refreshStatusBar()
+            self?.updateDailyBudget()
+            self?.recordHistory()
+        }
+        manager.switchTarget = { [weak self] in self?.switchTarget(from: $0) }
         manager.onAccountEdited = { [weak self] _ in self?.persist() }
         manager.accountHolding = { [weak self] uuid, email in
             let normalizedEmail = email?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1005,18 +1028,86 @@ class AccountsController: ObservableObject {
         UserDefaults.standard.removeObject(forKey: "last_notified_threshold_\(id.uuidString)")
         managers.remove(at: index)
         persist()
+        updateDailyBudget()
+        recordHistory()
     }
 
     func update(_ account: Account) {
         guard let manager = managers.first(where: { $0.account.id == account.id }) else { return }
         manager.account = account
         persist()
+        updateDailyBudget()
     }
 
     func persist() {
         AccountStore.save(accounts)
         refreshStatusBar()
         objectWillChange.send()
+    }
+
+    // MARK: - Daily allowance
+
+    private var budgetManagers: [UsageManager] { managers.filter(\.account.inDailyBudget) }
+
+    private var budgetReadings: [BudgetReading] {
+        budgetManagers.filter(\.hasFetchedData).map(\.budgetReading)
+    }
+
+    /// The account to use next, for the popup. Nil when none has usage left.
+    var recommendedBudgetAccount: BudgetReading? {
+        DailyBudget.recommended(from: budgetReadings)
+    }
+
+    var showsDailyBudget: Bool {
+        !budgetManagers.isEmpty && !budgetReadings.isEmpty
+    }
+
+    private func switchTarget(from manager: UsageManager) -> BudgetReading? {
+        DailyBudget.recommended(from: budgetReadings.filter { $0.id != manager.account.id.uuidString })
+    }
+
+    func updateDailyBudget() {
+        let included = budgetManagers
+        let readings = budgetReadings
+        let now = Date()
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+
+        dailyBudget.retain(ids: Set(included.map { $0.account.id.uuidString }))
+        let alerts = dailyBudget.observe(
+            readings,
+            day: formatter.string(from: now),
+            now: now,
+            complete: readings.count == included.count
+        )
+        if let data = try? JSONEncoder().encode(dailyBudget) {
+            UserDefaults.standard.set(data, forKey: Self.dailyBudgetKey)
+        }
+
+        guard usageNotificationsEnabled else { return }
+        let allowance = Int(dailyBudget.allowance.rounded())
+        for alert in alerts {
+            switch alert {
+            case .nearlyUsed:
+                Notifier.send(title: "Daily allowance", body: "\(dailyBudget.spent) of today's \(allowance) used.")
+            case .used:
+                let midnight = Calendar.current.startOfDay(for: now).addingTimeInterval(24 * 3600)
+                let tomorrow = Int(DailyBudget.allowance(for: readings, at: midnight).rounded())
+                Notifier.send(title: "Daily allowance", body: "Today's \(allowance) is used. Tomorrow's allowance: \(tomorrow).")
+            }
+        }
+    }
+
+    func recordHistory() {
+        usageHistory.retain(ids: Set(managers.map { $0.account.id.uuidString }))
+        usageHistory.observe(managers.filter(\.hasFetchedData).map(\.budgetReading), now: Date())
+        if let data = try? JSONEncoder().encode(usageHistory) {
+            UserDefaults.standard.set(data, forKey: Self.usageHistoryKey)
+        }
+    }
+
+    func stats(for manager: UsageManager) -> UsageHistory.Stats? {
+        usageHistory.stats(for: manager.account.id.uuidString, now: Date())
     }
 
     // MARK: - Refresh
@@ -1169,6 +1260,11 @@ class UsageManager: ObservableObject {
     /// Whether usage notifications are on. Owned globally by AccountsController,
     /// read here so one toggle governs every account.
     var notificationsEnabled: () -> Bool = { true }
+    var switchTarget: (UsageManager) -> BudgetReading? = { _ in nil }
+
+    var budgetReading: BudgetReading {
+        BudgetReading(id: account.id.uuidString, name: account.displayName, used: weeklyPercent, resetsAt: weeklyResetsAt)
+    }
 
     /// Name of the other account already signed in to this login, if any. Set
     /// by the controller, which is the only object that sees every account.
@@ -2154,7 +2250,8 @@ class UsageManager: ObservableObject {
             return
         }
 
-        let thresholds = [25, 50, 75, 90]
+        // The daily allowance replaces the lower alerts on accounts it covers.
+        let thresholds = account.inDailyBudget ? [90] : [25, 50, 75, 90]
 
         for threshold in thresholds {
             if percentage >= threshold && lastNotifiedThreshold < threshold {
@@ -2180,6 +2277,13 @@ class UsageManager: ObservableObject {
     func sendNotification(percentage: Int, threshold: Int) {
         let binding = bindingLimit
         let limitName = binding.kind == .weekly ? "7-day weekly" : "5-hour session"
+        if account.inDailyBudget, let target = switchTarget(self) {
+            Notifier.send(
+                title: "\(account.emoji) \(account.displayName)",
+                body: "At \(percentage)%. Switch to \(target.name), \(100 - target.used)% left."
+            )
+            return
+        }
         Notifier.send(
             title: "\(account.emoji) \(account.displayName)",
             body: "You've reached \(percentage)% of your \(limitName) limit"
@@ -2874,6 +2978,7 @@ struct UsageView: View {
     @State private var showingCookieInput: Bool = false
     @State private var showingSettings: Bool = false
     @State private var showingStatusDetails: Bool = false
+    @AppStorage("popup_tab") private var tab: String = "usage"
     @State private var measuredHeight: CGFloat = 250
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage("appearance_mode") private var appearanceMode: String = "system"
@@ -2944,9 +3049,13 @@ struct UsageView: View {
 
     var content: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Claude Usage")
-                .font(.headline)
-                .padding(.bottom, 4)
+            HStack {
+                Text("Claude Usage")
+                    .font(.headline)
+                Spacer()
+                ChoicePills(selection: $tab, options: [("Usage", "usage"), ("Statistics", "stats")])
+            }
+            .padding(.bottom, 4)
 
             // Free-form message banner (author-controlled). Takes priority over
             // the version-update banner when both are present.
@@ -3025,12 +3134,25 @@ struct UsageView: View {
                 .cornerRadius(6)
             }
 
+            if tab == "stats" {
+                StatisticsSection(accounts: accounts)
+            } else {
+            if accounts.showsDailyBudget {
+                DailyBudgetRow(
+                    spent: accounts.dailyBudget.spent,
+                    allowance: Int(accounts.dailyBudget.allowance.rounded()),
+                    recommended: accounts.recommendedBudgetAccount?.name
+                )
+                Divider()
+            }
+
             // One section per account, stacked. Both accounts visible at once.
             ForEach(accounts.managers, id: \.account.id) { manager in
                 if manager.account.id != accounts.managers.first?.account.id {
                     Divider()
                 }
                 AccountUsageSection(manager: manager, accounts: accounts)
+            }
             }
 
 
@@ -3508,6 +3630,26 @@ struct UsageView: View {
 /// The account's colour appears on the name and the left accent stripe only.
 /// Progress bars and percentages keep the severity colours, so colour always
 /// answers "how close to the limit", never "which account".
+struct DailyBudgetRow: View {
+    let spent: Int
+    let allowance: Int
+    let recommended: String?
+
+    var body: some View {
+        HStack {
+            Text("Today: \(spent) of \(allowance)")
+                .font(.subheadline)
+                .foregroundColor(spent >= allowance ? .red : .primary)
+            Spacer()
+            if let recommended {
+                Text("Use \(recommended)")
+                    .font(.caption)
+                    .foregroundColor(Color.secondaryText)
+            }
+        }
+    }
+}
+
 struct AccountUsageSection: View {
     @ObservedObject var manager: UsageManager
     @ObservedObject var accounts: AccountsController
@@ -4108,6 +4250,17 @@ struct AccountsSettingsSection: View {
 
             if isEditing {
                 VStack(alignment: .leading, spacing: 8) {
+                    Toggle("Count in daily allowance", isOn: Binding(
+                        get: { manager.account.inDailyBudget },
+                        set: { newValue in
+                            var updated = manager.account
+                            updated.inDailyBudget = newValue
+                            accounts.update(updated)
+                        }
+                    ))
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+
                     HStack(spacing: 6) {
                         Text("Name")
                             .font(.caption2)

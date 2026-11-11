@@ -126,6 +126,12 @@ Access settings by clicking the gear icon in the popup:
 ./create_dmg.sh
 ```
 
+### Publish a Release
+Bump `CFBundleVersion` in `Info.plist`, commit on `main`, then:
+```bash
+./release.sh
+```
+
 ### Clean Build
 ```bash
 rm -rf build

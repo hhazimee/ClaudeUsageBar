@@ -46,7 +46,7 @@ APPLESCRIPT
 hdiutil create -volname "${APP_NAME}" -srcfolder "$TMP_DIR" -ov -format UDRW temp.dmg
 
 # Mount it
-MOUNT_DIR=$(hdiutil attach -readwrite -noverify temp.dmg | grep Volumes | awk '{print $3}')
+MOUNT_DIR=$(hdiutil attach -readwrite -noverify temp.dmg | grep Volumes | cut -f3)
 
 # Run AppleScript to set up the window (replace placeholders)
 sed "s/DISK_NAME/${APP_NAME}/g; s/APP_NAME/${APP_NAME}/g" /tmp/dmg_setup.applescript > /tmp/dmg_setup_final.applescript

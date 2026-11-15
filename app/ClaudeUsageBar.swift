@@ -151,6 +151,51 @@ struct PaceTooltip: View {
     }
 }
 
+/// One account's pill in the menu bar.
+struct MenuBarPill {
+    let emoji: String
+    let value: String
+    let tint: NSColor
+    let dimmed: Bool
+
+    private static let height: CGFloat = 18
+    private static let padX: CGFloat = 6
+    private static let gap: CGFloat = 4
+
+    private func text() -> NSAttributedString {
+        let out = NSMutableAttributedString(string: emoji + " ", attributes: [.font: NSFont.systemFont(ofSize: 11)])
+        out.append(NSAttributedString(string: value, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
+            .foregroundColor: NSColor.labelColor,
+        ]))
+        return out
+    }
+
+    /// Draws lazily so label colours follow the menu bar's light or dark look.
+    static func render(_ pills: [MenuBarPill]) -> NSImage {
+        let texts = pills.map { $0.text() }
+        let widths = texts.map { ceil($0.size().width) + padX * 2 }
+        let total = widths.reduce(0, +) + gap * CGFloat(max(pills.count - 1, 0))
+        return NSImage(size: NSSize(width: total, height: height), flipped: false) { _ in
+            var x: CGFloat = 0
+            for (i, pill) in pills.enumerated() {
+                let rect = NSRect(x: x, y: 0, width: widths[i], height: height)
+                pill.tint.withAlphaComponent(pill.dimmed ? 0.12 : 0.32).setFill()
+                NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
+                let size = texts[i].size()
+                let origin = NSPoint(x: x + padX, y: (height - size.height) / 2)
+                if pill.dimmed {
+                    NSGraphicsContext.current?.cgContext.setAlpha(0.45)
+                }
+                texts[i].draw(at: origin)
+                NSGraphicsContext.current?.cgContext.setAlpha(1)
+                x += widths[i] + gap
+            }
+            return true
+        }
+    }
+}
+
 // Main entry point
 class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     var statusItem: NSStatusItem!
@@ -185,6 +230,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         accounts = AccountsController()
         accounts.delegate = self
         accounts.refreshStatusBar()
+        applyDockPreference()
         statusManager = StatusManager()
         updateManager = UpdateManager()
 
@@ -464,70 +510,65 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         }
     }
 
-    /// Draws every account into the menu bar as "<emoji> <percent>", with the
-    /// percentage carrying the severity colour. Identity is the emoji, so the
-    /// two signals never collide.
+    /// Draws every account into the menu bar as a pill: "<emoji> <percent>",
+    /// tinted by severity.
     func renderStatusBar(for managers: [UsageManager]) {
         guard let button = statusItem.button else { return }
-        let showCountdown = accounts?.showCountdown ?? false
-
-        let title = NSMutableAttributedString()
-        let font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        button.title = ""
+        button.attributedTitle = NSAttributedString(string: "")
+        defer { updateDockIcon(for: managers) }
 
         if managers.isEmpty {
             button.image = createSparkIcon(color: .secondaryLabelColor)
-            button.attributedTitle = NSAttributedString(string: "")
             return
         }
 
-        for (index, manager) in managers.enumerated() {
-            if index > 0 {
-                title.append(NSAttributedString(string: "  "))
-            }
-
-            title.append(NSAttributedString(
-                string: manager.account.emoji + " ",
-                attributes: [
-                    .font: NSFont.systemFont(ofSize: 11),
-                    .foregroundColor: manager.needsReauth
-                        ? NSColor.labelColor.withAlphaComponent(0.4)
-                        : NSColor.labelColor
-                ]
-            ))
-
+        let pills: [MenuBarPill] = managers.map { manager in
             let hasData = manager.hasFetchedData
-            let binding = manager.bindingLimit
-            // "W" only when the weekly cap is the binding one, so the usual
-            // case stays as short as it was with a single limit.
-            let marker = binding.kind == .weekly ? "W" : ""
-            title.append(NSAttributedString(
-                string: hasData ? "\(marker)\(binding.percent)%" : "--",
-                attributes: [
-                    .font: font,
-                    .foregroundColor: hasData
-                        ? AppDelegate.severityColor(for: binding.percent)
-                        : NSColor.secondaryLabelColor
-                ]
-            ))
-
-            // Time until the binding limit frees up, when enabled.
-            if showCountdown, hasData,
-               let resetsAt = manager.bindingResetsAt,
-               let remaining = formatCountdown(to: resetsAt) {
-                title.append(NSAttributedString(
-                    string: " \u{00B7} \(remaining)",
-                    attributes: [
-                        .font: NSFont.systemFont(ofSize: 11),
-                        .foregroundColor: NSColor.secondaryLabelColor
-                    ]
-                ))
-            }
+            let percent = manager.bindingLimit.percent
+            // A full account shows when it is back instead of "100".
+            let backIn = manager.isBlocked
+                ? manager.bindingResetsAt.flatMap { formatShortCountdown(to: $0) }
+                : nil
+            return MenuBarPill(emoji: manager.account.emoji,
+                               value: backIn ?? (hasData ? "\(percent)" : "--"),
+                               tint: hasData ? AppDelegate.severityColor(for: percent) : .secondaryLabelColor,
+                               dimmed: manager.needsReauth)
         }
+        let image = MenuBarPill.render(pills)
+        button.image = image
+        button.imagePosition = .imageOnly
+    }
 
-        // The per-account emoji replaces the single global spark.
-        button.image = nil
-        button.title = ""
-        button.attributedTitle = title
+    // MARK: - Dock
+
+    var showInDock: Bool { UserDefaults.standard.bool(forKey: "show_in_dock") }
+
+    var dockHover: DockHoverController?
+
+    func applyDockPreference() {
+        NSApp.setActivationPolicy(showInDock ? .regular : .accessory)
+        if showInDock {
+            if dockHover == nil, let accounts { dockHover = DockHoverController(accounts: accounts) }
+            dockHover?.start()
+        } else {
+            dockHover?.stop()
+        }
+        if let managers = accounts?.managers { updateDockIcon(for: managers) }
+    }
+
+    func updateDockIcon(for managers: [UsageManager]) {
+        guard showInDock else { return }
+        let rings = managers.map { m in
+            DockRings.Ring(percent: m.hasFetchedData ? m.bindingLimit.percent : nil,
+                           dimmed: m.needsReauth)
+        }
+        NSApp.applicationIconImage = DockRings.render(rings)
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        dockHover?.toggle()
+        return false
     }
 
     func createSparkIcon(color: NSColor) -> NSImage {
@@ -599,7 +640,7 @@ struct Main {
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
-        app.setActivationPolicy(.accessory)
+        app.setActivationPolicy(UserDefaults.standard.bool(forKey: "show_in_dock") ? .regular : .accessory)
         app.run()
     }
 }
@@ -843,7 +884,7 @@ enum AccountStore {
             do {
                 try store.save(credential, for: account.id)
             } catch {
-                NSLog("\u{274C} Could not move '\(account.displayName)' credentials to the keychain: \(error)")
+                NSLog("\u{274C} Could not move '\(account.displayName)' credentials to encrypted storage: \(error)")
                 continue
             }
 
@@ -1487,7 +1528,7 @@ class UsageManager: ObservableObject {
             try credentials.mutate(account.id) { $0.cookie = cookie }
         } catch {
             NSLog("❌ Could not save cookie for '\(account.displayName)': \(error)")
-            return "Could not save that cookie to the keychain"
+            return "Could not save that cookie"
         }
 
         account.hasCookie = !cookie.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -2104,7 +2145,7 @@ class UsageManager: ObservableObject {
                 }
                 if let resetsAtString = fiveHour["resets_at"] as? String {
                     NSLog("🕐 Session resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
+                    if let resetsAt = parseISODate(resetsAtString) {
                         sessionResetsAt = resetsAt
                         NSLog("✅ Parsed session reset time: \(resetsAt)")
                     } else {
@@ -2132,7 +2173,7 @@ class UsageManager: ObservableObject {
                 }
                 if let resetsAtString = sevenDay["resets_at"] as? String {
                     NSLog("🕐 Weekly resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
+                    if let resetsAt = parseISODate(resetsAtString) {
                         weeklyResetsAt = resetsAt
                         NSLog("✅ Parsed weekly reset time: \(resetsAt)")
                     } else {
@@ -2150,7 +2191,7 @@ class UsageManager: ObservableObject {
                 }
                 if let resetsAtString = sevenDaySonnet["resets_at"] as? String {
                     NSLog("🕐 Weekly Sonnet resets_at string: \(resetsAtString)")
-                    if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
+                    if let resetsAt = parseISODate(resetsAtString) {
                         weeklySonnetResetsAt = resetsAt
                         NSLog("✅ Parsed weekly Sonnet reset time: \(resetsAt)")
                     } else {
@@ -2183,7 +2224,7 @@ class UsageManager: ObservableObject {
                     weeklyFableLimit = 100
                     if let resetsAtString = fable["resets_at"] as? String {
                         NSLog("🕐 Weekly Fable resets_at string: \(resetsAtString)")
-                        if let resetsAt = iso8601Formatter.date(from: resetsAtString) {
+                        if let resetsAt = parseISODate(resetsAtString) {
                             weeklyFableResetsAt = resetsAt
                             NSLog("✅ Parsed weekly Fable reset time: \(resetsAt)")
                         } else {
@@ -2950,6 +2991,22 @@ func formatCountdown(to date: Date, from now: Date = Date()) -> String? {
     return "\(minutes)m"
 }
 
+/// Reads API timestamps with or without fractional seconds.
+func parseISODate(_ string: String) -> Date? {
+    let withFraction = ISO8601DateFormatter()
+    withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return withFraction.date(from: string) ?? ISO8601DateFormatter().date(from: string)
+}
+
+/// Largest whole unit only, for the menu bar: "2d", "5h", "29m".
+func formatShortCountdown(to date: Date, from now: Date = Date()) -> String? {
+    let seconds = Int(date.timeIntervalSince(now))
+    guard seconds > 0 else { return nil }
+    if seconds >= 86_400 { return "\(seconds / 86_400)d" }
+    if seconds >= 3_600 { return "\(seconds / 3_600)h" }
+    return "\(max(1, seconds / 60))m"
+}
+
 /// "in 2h 14m" when counting down, otherwise "at 2:49 PM" / "on 2 Sep ...".
 func formatReset(_ date: Date, includeDate: Bool = false, relative: Bool) -> String {
     if relative, let remaining = formatCountdown(to: date) {
@@ -2982,6 +3039,7 @@ struct UsageView: View {
     @State private var measuredHeight: CGFloat = 250
     @Environment(\.colorScheme) private var colorScheme
     @AppStorage("appearance_mode") private var appearanceMode: String = "system"
+    @AppStorage("show_in_dock") private var showInDock: Bool = false
 
     private let maxPopupHeight: CGFloat = 600
 
@@ -3137,14 +3195,7 @@ struct UsageView: View {
             if tab == "stats" {
                 StatisticsSection(accounts: accounts)
             } else {
-            if accounts.showsDailyBudget {
-                DailyBudgetRow(
-                    spent: accounts.dailyBudget.spent,
-                    allowance: Int(accounts.dailyBudget.allowance.rounded()),
-                    recommended: accounts.recommendedBudgetAccount?.name
-                )
-                Divider()
-            }
+            SummaryStrip(tiles: summaryTiles)
 
             // One section per account, stacked. Both accounts visible at once.
             ForEach(accounts.managers, id: \.account.id) { manager in
@@ -3334,7 +3385,7 @@ struct UsageView: View {
                         VStack(alignment: .leading, spacing: 1) {
                             Text("Show time remaining")
                                 .font(.caption)
-                            Text("Counts down to the reset in the menu bar")
+                            Text("Counts down to each reset")
                                 .font(.caption2)
                                 .foregroundColor(Color.secondaryText)
                         }
@@ -3356,6 +3407,19 @@ struct UsageView: View {
                                 .font(.caption2)
                                 .foregroundColor(Color.secondaryText)
                         }
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+
+                    Toggle(isOn: Binding(
+                        get: { showInDock },
+                        set: { newValue in
+                            showInDock = newValue
+                            (NSApp.delegate as? AppDelegate)?.applyDockPreference()
+                        }
+                    )) {
+                        Text("Show in Dock")
+                            .font(.caption)
                     }
                     .toggleStyle(.switch)
                     .controlSize(.mini)
@@ -3512,6 +3576,24 @@ struct UsageView: View {
         }
     }
 
+    private var summaryTiles: [SummaryStrip.Tile] {
+        var tiles: [SummaryStrip.Tile] = []
+        if accounts.showsDailyBudget {
+            let spent = accounts.dailyBudget.spent
+            let allowance = Int(accounts.dailyBudget.allowance.rounded())
+            tiles.append(.init(label: "Today", value: "\(spent) of \(allowance)", alert: spent >= allowance))
+            if let next = accounts.recommendedBudgetAccount,
+               let manager = accounts.managers.first(where: { $0.account.id.uuidString == next.id }) {
+                tiles.append(.init(label: "Use next", value: "\(manager.account.emoji) \(next.name)"))
+            }
+        }
+        let resets = accounts.managers.filter(\.hasFetchedData).compactMap(\.bindingResetsAt).filter { $0 > Date() }
+        if let soonest = resets.min() {
+            tiles.append(.init(label: "Next reset", value: formatShortCountdown(to: soonest) ?? "now"))
+        }
+        return tiles
+    }
+
     func formatNumber(_ number: Int) -> String {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
@@ -3630,21 +3712,34 @@ struct UsageView: View {
 /// The account's colour appears on the name and the left accent stripe only.
 /// Progress bars and percentages keep the severity colours, so colour always
 /// answers "how close to the limit", never "which account".
-struct DailyBudgetRow: View {
-    let spent: Int
-    let allowance: Int
-    let recommended: String?
+/// Small labelled figures across the top of the popup.
+struct SummaryStrip: View {
+    struct Tile: Hashable {
+        let label: String
+        let value: String
+        var alert = false
+    }
+    let tiles: [Tile]
 
     var body: some View {
-        HStack {
-            Text("Today: \(spent) of \(allowance)")
-                .font(.subheadline)
-                .foregroundColor(spent >= allowance ? .red : .primary)
-            Spacer()
-            if let recommended {
-                Text("Use \(recommended)")
-                    .font(.caption)
-                    .foregroundColor(Color.secondaryText)
+        if !tiles.isEmpty {
+            HStack(spacing: 6) {
+                ForEach(tiles, id: \.self) { tile in
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(tile.label.uppercased())
+                            .font(.system(size: 9, weight: .medium))
+                            .tracking(0.4)
+                            .foregroundColor(Color.secondaryText)
+                        Text(tile.value)
+                            .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                            .foregroundColor(tile.alert ? .red : .primary)
+                            .lineLimit(1)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+                    .background(Color.primary.opacity(0.06))
+                    .cornerRadius(8)
+                }
             }
         }
     }
@@ -3659,8 +3754,51 @@ struct AccountUsageSection: View {
     @State private var hasSavedCookie: Bool = false
     @State private var pasteInput: String = ""
     @State private var showCookie: Bool = false
+    @AppStorage("expanded_account") private var expandedAccount: String = ""
 
     private var account: Account { manager.account }
+
+    /// One card open at a time. A sign-in in progress keeps its card open.
+    private var isExpanded: Bool {
+        expandedAccount == account.id.uuidString || manager.awaitingPasteCode
+    }
+
+    private func toggleExpanded() {
+        withAnimation(.easeInOut(duration: 0.15)) {
+            expandedAccount = isExpanded ? "" : account.id.uuidString
+        }
+    }
+
+    /// Collapsed card: a thin bar per limit and the next reset.
+    @ViewBuilder
+    private var compactSummary: some View {
+        if manager.needsReauth || !manager.hasFetchedData && manager.errorMessage != nil {
+            Button("Sign in") {
+                expandedAccount = account.id.uuidString
+                showingCookieInput = true
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        } else if manager.hasFetchedData {
+            VStack(alignment: .leading, spacing: 4) {
+                if manager.hasSessionLimit {
+                    UsageBar(value: manager.sessionPercentage,
+                             color: colorForPercentage(manager.sessionPercentage))
+                }
+                UsageBar(value: manager.weeklyPercentage,
+                         color: colorForPercentage(manager.weeklyPercentage))
+                HStack {
+                    Text(manager.hasSessionLimit ? "Session · Weekly" : "Weekly")
+                    Spacer()
+                    if let resetsAt = manager.bindingResetsAt {
+                        Text("Resets \(formatReset(resetsAt, includeDate: manager.bindingLimit.kind == .weekly, relative: accounts.showCountdown))")
+                    }
+                }
+                .font(.caption2)
+                .foregroundColor(Color.secondaryText)
+            }
+        }
+    }
 
     // MARK: - Reset and pace labels
 
@@ -3882,6 +4020,7 @@ struct AccountUsageSection: View {
             VStack(alignment: .leading, spacing: 12) {
                 header
                 blockedBanner
+            if isExpanded {
             if let error = manager.errorMessage {
                 Text(error)
                     .font(.caption)
@@ -4121,6 +4260,9 @@ struct AccountUsageSection: View {
                 .cornerRadius(6)
                 .id("cookie-anchor")
             }
+            } else {
+                compactSummary
+            }
             }
         }
         .onAppear {
@@ -4166,6 +4308,10 @@ struct AccountUsageSection: View {
 
     private var header: some View {
         HStack(spacing: 6) {
+            Image(systemName: "chevron.right")
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundColor(Color.secondaryText)
+                .rotationEffect(.degrees(isExpanded ? 90 : 0))
             Text(account.emoji)
                 .font(.system(size: 13))
                 .opacity(manager.needsReauth ? 0.4 : 1)
@@ -4186,6 +4332,9 @@ struct AccountUsageSection: View {
                     .foregroundColor(colorForPercentage(Double(binding.percent) / 100.0))
             }
         }
+        .contentShape(Rectangle())
+        .onTapGesture(perform: toggleExpanded)
+        .opacity(manager.needsReauth ? 0.55 : 1)
     }
 }
 

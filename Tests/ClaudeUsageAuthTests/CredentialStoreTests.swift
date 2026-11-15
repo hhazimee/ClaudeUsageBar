@@ -4,10 +4,9 @@ import Foundation
 
 @Suite("Credential store")
 struct CredentialStoreTests {
-    /// A service name unique to this run, so a test never reads, writes or
-    /// deletes the real app's items.
+    /// A folder unique to this run, so a test never touches the real app's files.
     func makeStore() -> CredentialStore {
-        CredentialStore(service: "com.hazime.claudeusagemulti.tests.\(UUID().uuidString)")
+        CredentialStore(directory: FileManager.default.temporaryDirectory.appendingPathComponent("cred-tests-\(UUID().uuidString)"), legacyKeychainService: nil)
     }
 
     @Test func readingAnUnknownAccountReturnsNil() {

@@ -47,7 +47,7 @@ struct CredentialProviderTests {
     let now = Date(timeIntervalSince1970: 1_800_000_000)
 
     func makeStore() -> CredentialStore {
-        CredentialStore(service: "com.hazime.claudeusagemulti.tests.\(UUID().uuidString)")
+        CredentialStore(directory: FileManager.default.temporaryDirectory.appendingPathComponent("cred-tests-\(UUID().uuidString)"), legacyKeychainService: nil)
     }
 
     func await_(_ provider: CredentialProvider, _ id: UUID) async -> CredentialOutcome {

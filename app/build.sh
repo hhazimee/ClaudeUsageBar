@@ -42,7 +42,7 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
-    -target arm64-apple-macos12.0
+    -target arm64-apple-macos12.0 || { echo "❌ Build failed" >&2; exit 1; }
 
 # Compile for x86_64 (Intel)
 swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
@@ -53,12 +53,12 @@ swiftc -parse-as-library -o "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" \
     -framework SwiftUI \
     -framework AppKit \
     -framework WebKit \
-    -target x86_64-apple-macos12.0
+    -target x86_64-apple-macos12.0 || { echo "❌ Build failed" >&2; exit 1; }
 
 # Create universal binary
 lipo -create -output "$APP_PATH/Contents/MacOS/ClaudeUsageBar" \
     "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64" \
-    "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64"
+    "$APP_PATH/Contents/MacOS/ClaudeUsageBar_x86_64" || exit 1
 
 # Clean up individual arch binaries
 rm "$APP_PATH/Contents/MacOS/ClaudeUsageBar_arm64"
@@ -93,6 +93,9 @@ elif [ "${RELEASE:-0}" = "1" ]; then
     echo "❌ Developer ID signing failed. NOT falling back to ad-hoc (would break notarization)." >&2
     echo "   Fix the cause above (often: stale xattrs / ._files / cert not in keychain) and re-run." >&2
     exit 1
+elif codesign --force --deep --sign "ClaudeUsage Local Signing" "$APP_PATH" 2>/dev/null; then
+    # A stable local identity keeps Keychain from asking again after each build.
+    echo "✅ App signed with the local signing certificate"
 else
     echo "⚠️  No Developer ID cert found, signing ad-hoc for local use."
     echo "   Set RELEASE=1 to make missing signing a hard failure."

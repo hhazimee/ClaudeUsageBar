@@ -11,13 +11,15 @@ public protocol ClaudeCodeLive {
 }
 
 public final class SystemClaudeCodeLive: ClaudeCodeLive {
-    static let service = "Claude Code-credentials"
+    private let service: String
     private let configURL: URL
     private let keychainAccount: String
 
     public init(configURL: URL = FileManager.default.homeDirectoryForCurrentUser
                     .appendingPathComponent(".claude.json"),
-                keychainAccount: String = NSUserName()) {
+                keychainAccount: String = NSUserName(),
+                service: String = "Claude Code-credentials") {
+        self.service = service
         self.configURL = configURL
         self.keychainAccount = keychainAccount
     }
@@ -26,7 +28,7 @@ public final class SystemClaudeCodeLive: ClaudeCodeLive {
     /// directly would add this app to its access list, and macOS then locks
     /// the `security` tool out, so every Claude Code session asks for a password.
     public func readKeychain() throws -> Data? {
-        let result = Self.run(["find-generic-password", "-a", keychainAccount, "-s", Self.service, "-w"])
+        let result = Self.run(["find-generic-password", "-a", keychainAccount, "-s", service, "-w"])
         if result.status == 44 { return nil }
         guard result.status == 0 else { throw ClaudeCodeError.keychain(result.status) }
         let text = String(decoding: result.output, as: UTF8.self)
@@ -36,27 +38,32 @@ public final class SystemClaudeCodeLive: ClaudeCodeLive {
         return Data(text.utf8)
     }
 
-    /// Updates the existing item only, never creates one.
+    /// Updates the existing item only, never creates one. Reads the value back
+    /// and restores the original if it did not land intact.
     public func writeKeychain(_ data: Data) throws {
-        guard try readKeychain() != nil else { throw ClaudeCodeError.notLoggedIn }
-        let hex = data.map { String(format: "%02x", $0) }.joined()
-        // Sent on stdin through `security -i`, so the secret never shows in the process list.
-        let command = "add-generic-password -U -a \"\(keychainAccount)\" -s \"\(Self.service)\" -X \(hex)\n"
-        let result = Self.run(["-i"], input: Data(command.utf8))
-        guard result.status == 0 else { throw ClaudeCodeError.keychain(result.status) }
+        guard let original = try readKeychain() else { throw ClaudeCodeError.notLoggedIn }
+        let status = store(data)
+        if status == 0, (try? readKeychain()) == data { return }
+        _ = store(original)
+        throw ClaudeCodeError.keychain(status == 0 ? -1 : status)
     }
 
-    private static func run(_ arguments: [String], input: Data? = nil) -> (status: Int32, output: Data) {
+    /// Passed as an argument, as Claude Code does: `security -i` cuts input
+    /// lines at about 4 KB and runs the truncated command.
+    private func store(_ data: Data) -> Int32 {
+        let hex = data.map { String(format: "%02x", $0) }.joined()
+        return Self.run(["add-generic-password", "-U", "-a", keychainAccount, "-s", service, "-X", hex]).status
+    }
+
+    private static func run(_ arguments: [String]) -> (status: Int32, output: Data) {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         process.arguments = arguments
-        let out = Pipe(), inPipe = Pipe()
+        let out = Pipe()
         process.standardOutput = out
         process.standardError = FileHandle.nullDevice
-        process.standardInput = inPipe
+        process.standardInput = FileHandle.nullDevice
         do { try process.run() } catch { return (-1, Data()) }
-        if let input { inPipe.fileHandleForWriting.write(input) }
-        try? inPipe.fileHandleForWriting.close()
         let output = out.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         return (process.terminationStatus, output)

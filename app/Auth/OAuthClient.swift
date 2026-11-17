@@ -54,7 +54,7 @@ public protocol TokenRefreshing {
 }
 
 public final class OAuthClient: TokenRefreshing {
-    private let session: URLSession
+    let session: URLSession
 
     public init(session: URLSession = .shared) {
         self.session = session
@@ -137,5 +137,32 @@ public final class OAuthClient: TokenRefreshing {
             }
             completion(.success(decoded))
         }.resume()
+    }
+}
+
+extension OAuthClient: ProfileChecking {
+    static let profileURL = URL(string: "https://api.anthropic.com/api/oauth/profile")!
+
+    private struct Profile: Decodable {
+        struct Account: Decodable { let uuid: String? }
+        let account: Account?
+    }
+
+    public func accountUUID(accessToken: String) async -> String? {
+        var request = URLRequest(url: Self.profileURL)
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(OAuthEndpoints.userAgent, forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 15
+        return await withCheckedContinuation { continuation in
+            session.dataTask(with: request) { data, response, _ in
+                guard (response as? HTTPURLResponse)?.statusCode == 200, let data,
+                      let profile = try? JSONDecoder().decode(Profile.self, from: data) else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                continuation.resume(returning: profile.account?.uuid)
+            }.resume()
+        }
     }
 }

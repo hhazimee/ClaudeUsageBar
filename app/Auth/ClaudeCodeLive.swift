@@ -1,5 +1,4 @@
 import Foundation
-import Security
 
 /// Claude Code's live login: its Keychain item and `~/.claude.json`.
 public protocol ClaudeCodeLive {
@@ -23,32 +22,57 @@ public final class SystemClaudeCodeLive: ClaudeCodeLive {
         self.keychainAccount = keychainAccount
     }
 
-    private var query: [String: Any] {
-        [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: Self.service,
-         kSecAttrAccount as String: keychainAccount]
+    /// Goes through `/usr/bin/security`, as Claude Code does. Reading the item
+    /// directly would add this app to its access list, and macOS then locks
+    /// the `security` tool out, so every Claude Code session asks for a password.
+    public func readKeychain() throws -> Data? {
+        let result = Self.run(["find-generic-password", "-a", keychainAccount, "-s", Self.service, "-w"])
+        if result.status == 44 { return nil }
+        guard result.status == 0 else { throw ClaudeCodeError.keychain(result.status) }
+        let text = String(decoding: result.output, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // `security -w` prints a value containing newlines as hex.
+        if !text.hasPrefix("{"), let decoded = Self.hexDecoded(text) { return decoded }
+        return Data(text.utf8)
     }
 
-    public func readKeychain() throws -> Data? {
-        var read = query
-        read[kSecReturnData as String] = true
-        read[kSecMatchLimit as String] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(read as CFDictionary, &result)
-        if status == errSecItemNotFound { return nil }
-        guard status == errSecSuccess, let data = result as? Data else {
-            throw ClaudeCodeError.keychain(status)
+    /// Updates the existing item only, never creates one.
+    public func writeKeychain(_ data: Data) throws {
+        guard try readKeychain() != nil else { throw ClaudeCodeError.notLoggedIn }
+        let hex = data.map { String(format: "%02x", $0) }.joined()
+        // Sent on stdin through `security -i`, so the secret never shows in the process list.
+        let command = "add-generic-password -U -a \"\(keychainAccount)\" -s \"\(Self.service)\" -X \(hex)\n"
+        let result = Self.run(["-i"], input: Data(command.utf8))
+        guard result.status == 0 else { throw ClaudeCodeError.keychain(result.status) }
+    }
+
+    private static func run(_ arguments: [String], input: Data? = nil) -> (status: Int32, output: Data) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = arguments
+        let out = Pipe(), inPipe = Pipe()
+        process.standardOutput = out
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = inPipe
+        do { try process.run() } catch { return (-1, Data()) }
+        if let input { inPipe.fileHandleForWriting.write(input) }
+        try? inPipe.fileHandleForWriting.close()
+        let output = out.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return (process.terminationStatus, output)
+    }
+
+    private static func hexDecoded(_ text: String) -> Data? {
+        guard text.count % 2 == 0, !text.isEmpty else { return nil }
+        var data = Data(capacity: text.count / 2)
+        var index = text.startIndex
+        while index < text.endIndex {
+            let next = text.index(index, offsetBy: 2)
+            guard let byte = UInt8(text[index..<next], radix: 16) else { return nil }
+            data.append(byte)
+            index = next
         }
         return data
-    }
-
-    /// Never creates the item: one made by this app would carry access rights
-    /// Claude Code cannot use.
-    public func writeKeychain(_ data: Data) throws {
-        let status = SecItemUpdate(query as CFDictionary,
-                                   [kSecValueData as String: data] as CFDictionary)
-        if status == errSecItemNotFound { throw ClaudeCodeError.notLoggedIn }
-        guard status == errSecSuccess else { throw ClaudeCodeError.keychain(status) }
     }
 
     public func readConfig() throws -> Data? {

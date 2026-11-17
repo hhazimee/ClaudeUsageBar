@@ -283,6 +283,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         // Usage + Anthropic status are time-sensitive — poll every 5 min.
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { _ in
             self.accounts.fetchAll()
+            self.accounts.syncClaudeCode()
             self.statusManager.fetch()
         }
 
@@ -295,6 +296,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         Timer.scheduledTimer(withTimeInterval: 3 * 3600, repeats: true) { _ in
             self.updateManager.fetch()
         }
+
+        accounts.syncClaudeCode()
 
         // Set up Cmd+U keyboard shortcut
         setupKeyboardShortcut()
@@ -465,6 +468,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     }
 
     func openPopover() {
+        accounts.syncClaudeCode()
         if let button = statusItem.button {
             // Force UI refresh by updating percentages
             DispatchQueue.main.async {
@@ -1159,6 +1163,84 @@ class AccountsController: ObservableObject {
 
     func refreshStatusBar() {
         delegate?.renderStatusBar(for: managers)
+    }
+
+    // MARK: - Claude Code login
+
+    @Published private(set) var claudeCode = ClaudeCodeState()
+    /// Last switch problem per account, shown on its card.
+    @Published private(set) var claudeCodeErrors: [UUID: String] = [:]
+    @Published private(set) var claudeCodeSwitching: UUID?
+
+    private lazy var claudeCodeSwitcher = ClaudeCodeSwitcher(
+        live: SystemClaudeCodeLive(), profile: OAuthClient(), credentials: credentials)
+
+    var claudeCodeSwitchable: Bool { claudeCode.loggedIn && claudeCode.unknownEmail == nil }
+
+    private var claudeCodeIdentities: [ClaudeCodeIdentity] {
+        managers.map { ClaudeCodeIdentity(id: $0.account.id,
+                                          accountUUID: $0.account.accountUUID,
+                                          email: $0.account.accountEmail) }
+    }
+
+    private func publish(_ state: ClaudeCodeState) {
+        guard state != claudeCode else { return }
+        claudeCode = state
+        refreshStatusBar()
+    }
+
+    /// Saves Claude Code's current login to the matching account.
+    func syncClaudeCode() {
+        guard claudeCodeSwitching == nil else { return }
+        let identities = claudeCodeIdentities
+        Task { @MainActor in
+            publish(await claudeCodeSwitcher.capture(identities))
+        }
+    }
+
+    func switchClaudeCode(to id: UUID) {
+        guard claudeCodeSwitching == nil, let previous = claudeCode.activeID else { return }
+        claudeCodeSwitching = id
+        claudeCodeErrors[id] = nil
+        let identities = claudeCodeIdentities
+        Task { @MainActor in
+            defer { claudeCodeSwitching = nil }
+            do {
+                publish(try await claudeCodeSwitcher.switchTo(id, identities))
+                verifyClaudeCode(id, previous: previous, reapply: true)
+            } catch {
+                claudeCodeErrors[id] = Self.message(for: error)
+            }
+        }
+    }
+
+    /// A running session can write the old account back. Check after a minute,
+    /// put the target back once, then give up and say so.
+    private func verifyClaudeCode(_ id: UUID, previous: UUID, reapply: Bool) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+            guard let self, self.claudeCodeSwitching == nil else { return }
+            let identities = self.claudeCodeIdentities
+            Task { @MainActor in
+                let result = await self.claudeCodeSwitcher.verify(
+                    expected: id, previous: previous, reapply: reapply, identities)
+                switch result {
+                case .held: break
+                case .reapplied: self.verifyClaudeCode(id, previous: previous, reapply: false)
+                case .lost: self.claudeCodeErrors[id] = "A running session switched back"
+                }
+                self.syncClaudeCode()
+            }
+        }
+    }
+
+    private static func message(for error: Error) -> String {
+        switch error as? ClaudeCodeError {
+        case .notLoggedIn: return "Claude Code isn't logged in"
+        case .unconfirmed: return "Couldn't confirm the current login. Try again."
+        case .unknownLogin(let email): return "Claude Code is on \(email ?? "unknown"), which isn't in your accounts"
+        case .noSavedLogin: return "Log in to Claude Code as this account once"
+        default: return "Couldn't switch Claude Code"
+        }
     }
 
     // MARK: - Settings

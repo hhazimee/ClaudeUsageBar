@@ -72,12 +72,13 @@ public actor ClaudeCodeSwitcher {
         if let login = current.login, let id = match(login, accounts) {
             _ = await save(login, to: id, accounts)
         }
-        return state(current, accounts)
+        // Read again: Claude Code or a switch may have changed it during the check.
+        return state(try? read(), accounts)
     }
 
     public func switchTo(_ id: UUID, _ accounts: [ClaudeCodeIdentity]) async throws -> ClaudeCodeState {
         let current = try read()
-        guard let keychain = current.keychain, let login = current.login else {
+        guard current.keychain != nil, let login = current.login else {
             throw ClaudeCodeError.notLoggedIn
         }
         guard let activeID = match(login, accounts) else {
@@ -88,9 +89,13 @@ public actor ClaudeCodeSwitcher {
             throw ClaudeCodeError.noSavedLogin
         }
         // Keep the current account's newest refresh token before replacing it.
-        guard await save(login, to: activeID, accounts) else { throw ClaudeCodeError.unconfirmed }
-
-        try write(target, keychain: keychain, config: current.config)
+        guard await save(login, to: activeID, accounts),
+              let fresh = try? read(), let freshKeychain = fresh.keychain,
+              let freshLogin = fresh.login, Self.same(freshLogin.oauth, login.oauth) else {
+            throw ClaudeCodeError.unconfirmed
+        }
+        // Merge into what is there now, so MCP tokens renewed meanwhile survive.
+        try write(target, keychain: freshKeychain, config: fresh.config)
         return state(try read(), accounts)
     }
 
@@ -98,7 +103,7 @@ public actor ClaudeCodeSwitcher {
     /// write it back; this puts the target back once.
     public func verify(expected id: UUID, previous: UUID, reapply: Bool,
                        _ accounts: [ClaudeCodeIdentity]) async -> ClaudeCodeVerifyResult {
-        guard let current = try? read(), let keychain = current.keychain, let login = current.login,
+        guard let current = try? read(), let login = current.login,
               match(login, accounts) == previous else {
             // On the target, or moved elsewhere by hand: not ours to undo.
             return .held
@@ -106,7 +111,9 @@ public actor ClaudeCodeSwitcher {
         guard reapply,
               let target = credentials.stored(for: id)?.claudeCode,
               await save(login, to: previous, accounts),
-              (try? write(target, keychain: keychain, config: current.config)) != nil else {
+              let fresh = try? read(), let freshKeychain = fresh.keychain,
+              let freshLogin = fresh.login, Self.same(freshLogin.oauth, login.oauth),
+              (try? write(target, keychain: freshKeychain, config: fresh.config)) != nil else {
             return .lost
         }
         return .reapplied
@@ -135,6 +142,10 @@ public actor ClaudeCodeSwitcher {
         guard let token = login.accessToken,
               let expected = accounts.first(where: { $0.id == id })?.accountUUID ?? login.accountUUID,
               await profile.accountUUID(accessToken: token) == expected else { return false }
+        // The check took time. Save only if this is still the live login, so an
+        // older capture never overwrites a newer one.
+        guard let now = try? read(), let nowLogin = now.login,
+              Self.same(nowLogin.oauth, login.oauth) else { return false }
         return (try? credentials.mutate(id) { $0.claudeCode = login }) != nil
     }
 

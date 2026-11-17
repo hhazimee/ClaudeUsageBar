@@ -20,8 +20,12 @@ final class FakeProfile: ProfileChecking, @unchecked Sendable {
     /// Access token to account uuid. A missing token means the call failed.
     var owners: [String: String] = [:]
     var calls = 0
+    /// Runs while the call is in flight, to simulate Claude Code acting meanwhile.
+    var during: (() -> Void)?
     func accountUUID(accessToken: String) async -> String? {
         calls += 1
+        during?()
+        during = nil
         return owners[accessToken]
     }
 }
@@ -193,6 +197,48 @@ struct ClaudeCodeSwitcherTests {
         let state = try await switcher.switchTo(a.id, accounts)
         #expect(state.activeID == a.id)
         #expect(live.writes == 0)
+    }
+
+    @Test func switchedKeychainIsSingleLine() async throws {
+        logIn(token: "a1", uuid: "uA", email: "a@x.com")
+        try save(a.id, token: "a1", uuid: "uA", email: "a@x.com")
+        try save(b.id, token: "b1", uuid: "uB", email: "b@x.com")
+        _ = try await switcher.switchTo(b.id, accounts)
+        #expect(!live.keychain!.contains(0x0A))
+    }
+
+    @Test func switchAbortsWhenRenewedDuringCheck() async throws {
+        logIn(token: "a1", uuid: "uA", email: "a@x.com")
+        try save(b.id, token: "b1", uuid: "uB", email: "b@x.com")
+        profile.owners["a1"] = "uA"
+        profile.during = { self.logIn(token: "a2", uuid: "uA", email: "a@x.com") }
+        await #expect(throws: ClaudeCodeError.unconfirmed) {
+            try await switcher.switchTo(b.id, accounts)
+        }
+        #expect(liveToken == "a2")
+        #expect(savedToken(a.id) == nil)
+    }
+
+    @Test func switchMergesIntoFreshMcpTokens() async throws {
+        logIn(token: "a1", uuid: "uA", email: "a@x.com")
+        try save(b.id, token: "b1", uuid: "uB", email: "b@x.com")
+        profile.owners["a1"] = "uA"
+        profile.during = {
+            // Claude Code renews an MCP token but not the Claude login.
+            self.live.keychain = json(["claudeAiOauth": self.oauth("a1"), "mcpOAuth": ["srv": ["accessToken": "m2"]]])
+        }
+        _ = try await switcher.switchTo(b.id, accounts)
+        #expect((dict(live.keychain!)["mcpOAuth"] as? NSDictionary) == ["srv": ["accessToken": "m2"]])
+    }
+
+    @Test func captureDoesNotSaveLoginReplacedDuringCheck() async throws {
+        logIn(token: "a1", uuid: "uA", email: "a@x.com")
+        try save(a.id, token: "a2", uuid: "uA", email: "a@x.com")
+        profile.owners["a1"] = "uA"
+        profile.during = { self.logIn(token: "b1", uuid: "uB", email: "b@x.com") }
+        let state = await switcher.capture(accounts)
+        #expect(savedToken(a.id) == "a2")
+        #expect(state.activeID == b.id)
     }
 
     // MARK: Verify

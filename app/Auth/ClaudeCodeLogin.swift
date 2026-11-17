@@ -37,13 +37,15 @@ public enum ClaudeCodeJSON {
     }
 
     /// Replaces `claudeAiOauth`, keeping `mcpOAuth` and every other key.
+    /// Written on one line: `security -w` prints a value containing newlines
+    /// as hex, which Claude Code cannot parse.
     public static func mergeKeychain(_ existing: Data, oauth: Data) throws -> Data {
-        try replace(oauthKey, in: existing, with: oauth)
+        try replace(oauthKey, in: existing, with: oauth, options: [])
     }
 
     /// Replaces `oauthAccount`, keeping every other key.
     public static func mergeConfig(_ existing: Data, account: Data) throws -> Data {
-        try replace(accountKey, in: existing, with: account)
+        try replace(accountKey, in: existing, with: account, options: [.prettyPrinted])
     }
 
     static func object(_ data: Data) -> [String: Any]? {
@@ -54,13 +56,14 @@ public enum ClaudeCodeJSON {
         object(data)?[key] as? String
     }
 
-    private static func replace(_ key: String, in existing: Data, with value: Data) throws -> Data {
+    private static func replace(_ key: String, in existing: Data, with value: Data,
+                                options: JSONSerialization.WritingOptions) throws -> Data {
         guard var top = object(existing),
               let inner = try? JSONSerialization.jsonObject(with: value) else {
             throw ClaudeCodeError.config
         }
         top[key] = inner
-        return try JSONSerialization.data(withJSONObject: top, options: [.prettyPrinted])
+        return try JSONSerialization.data(withJSONObject: top, options: options)
     }
 }
 

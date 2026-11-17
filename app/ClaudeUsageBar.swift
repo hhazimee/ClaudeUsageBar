@@ -461,21 +461,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         if event.type == .rightMouseUp {
             // Right click - show menu
             let menu = NSMenu()
-            menu.autoenablesItems = false
-            let heading = NSMenuItem(title: "Claude Code", action: nil, keyEquivalent: "")
-            heading.isEnabled = false
-            menu.addItem(heading)
-            for manager in accounts.managers {
-                let account = manager.account
-                let item = NSMenuItem(title: "\(account.emoji) \(account.displayName)",
-                                      action: #selector(switchClaudeCodeFromMenu(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = account.id
-                let active = accounts.claudeCode.activeID == account.id
-                item.state = active ? .on : .off
-                item.isEnabled = active || (accounts.claudeCodeSwitchable && accounts.claudeCode.savedIDs.contains(account.id))
-                menu.addItem(item)
-            }
+            addClaudeCodeItems(to: menu)
             menu.addItem(NSMenuItem.separator())
             let toggleItem = NSMenuItem(title: "Toggle Usage (⌘U)", action: #selector(togglePopover), keyEquivalent: "u")
             toggleItem.keyEquivalentModifierMask = .command
@@ -489,6 +475,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             // Left click - toggle popover
             togglePopover()
         }
+    }
+
+    /// The account list for switching Claude Code, shared by the menu bar and Dock menus.
+    func addClaudeCodeItems(to menu: NSMenu) {
+        menu.autoenablesItems = false
+        let heading = NSMenuItem(title: "Claude Code", action: nil, keyEquivalent: "")
+        heading.isEnabled = false
+        menu.addItem(heading)
+        for manager in accounts.managers {
+            let account = manager.account
+            let item = NSMenuItem(title: "\(account.emoji) \(account.displayName)",
+                                  action: #selector(switchClaudeCodeFromMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = account.id
+            let active = accounts.claudeCode.activeID == account.id
+            item.state = active ? .on : .off
+            item.isEnabled = active || (accounts.claudeCodeSwitchable && accounts.claudeCode.savedIDs.contains(account.id))
+            menu.addItem(item)
+        }
+    }
+
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let menu = NSMenu()
+        addClaudeCodeItems(to: menu)
+        return menu
     }
 
     @objc func switchClaudeCodeFromMenu(_ sender: NSMenuItem) {

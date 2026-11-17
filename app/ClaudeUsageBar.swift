@@ -157,6 +157,8 @@ struct MenuBarPill {
     let value: String
     let tint: NSColor
     let dimmed: Bool
+    /// Claude Code is on this account.
+    var active = false
 
     private static let height: CGFloat = 18
     private static let padX: CGFloat = 6
@@ -182,6 +184,12 @@ struct MenuBarPill {
                 let rect = NSRect(x: x, y: 0, width: widths[i], height: height)
                 pill.tint.withAlphaComponent(pill.dimmed ? 0.12 : 0.32).setFill()
                 NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
+                if pill.active {
+                    let outline = NSBezierPath(roundedRect: rect.insetBy(dx: 0.75, dy: 0.75), xRadius: 4.5, yRadius: 4.5)
+                    outline.lineWidth = 1.5
+                    NSColor.labelColor.withAlphaComponent(0.7).setStroke()
+                    outline.stroke()
+                }
                 let size = texts[i].size()
                 let origin = NSPoint(x: x + padX, y: (height - size.height) / 2)
                 if pill.dimmed {
@@ -453,6 +461,22 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
         if event.type == .rightMouseUp {
             // Right click - show menu
             let menu = NSMenu()
+            menu.autoenablesItems = false
+            let heading = NSMenuItem(title: "Claude Code", action: nil, keyEquivalent: "")
+            heading.isEnabled = false
+            menu.addItem(heading)
+            for manager in accounts.managers {
+                let account = manager.account
+                let item = NSMenuItem(title: "\(account.emoji) \(account.displayName)",
+                                      action: #selector(switchClaudeCodeFromMenu(_:)), keyEquivalent: "")
+                item.target = self
+                item.representedObject = account.id
+                let active = accounts.claudeCode.activeID == account.id
+                item.state = active ? .on : .off
+                item.isEnabled = active || (accounts.claudeCodeSwitchable && accounts.claudeCode.savedIDs.contains(account.id))
+                menu.addItem(item)
+            }
+            menu.addItem(NSMenuItem.separator())
             let toggleItem = NSMenuItem(title: "Toggle Usage (⌘U)", action: #selector(togglePopover), keyEquivalent: "u")
             toggleItem.keyEquivalentModifierMask = .command
             menu.addItem(toggleItem)
@@ -465,6 +489,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             // Left click - toggle popover
             togglePopover()
         }
+    }
+
+    @objc func switchClaudeCodeFromMenu(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID else { return }
+        accounts.switchClaudeCode(to: id)
     }
 
     func openPopover() {
@@ -537,7 +566,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
             return MenuBarPill(emoji: manager.account.emoji,
                                value: backIn ?? (hasData ? "\(percent)" : "--"),
                                tint: hasData ? AppDelegate.severityColor(for: percent) : .secondaryLabelColor,
-                               dimmed: manager.needsReauth)
+                               dimmed: manager.needsReauth,
+                               active: accounts?.claudeCode.activeID == manager.account.id)
         }
         let image = MenuBarPill.render(pills)
         button.image = image
@@ -3279,6 +3309,12 @@ struct UsageView: View {
             } else {
             SummaryStrip(tiles: summaryTiles)
 
+            if let email = accounts.claudeCode.unknownEmail {
+                Text("Claude Code is on \(email), which isn't in your accounts")
+                    .font(.caption)
+                    .foregroundColor(Color.secondaryText)
+            }
+
             // One section per account, stacked. Both accounts visible at once.
             ForEach(accounts.managers, id: \.account.id) { manager in
                 if manager.account.id != accounts.managers.first?.account.id {
@@ -4101,6 +4137,11 @@ struct AccountUsageSection: View {
 
             VStack(alignment: .leading, spacing: 12) {
                 header
+                if let error = accounts.claudeCodeErrors[account.id] {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                }
                 blockedBanner
             if isExpanded {
             if let error = manager.errorMessage {
@@ -4402,6 +4443,11 @@ struct AccountUsageSection: View {
                 .fontWeight(.semibold)
                 .foregroundColor(account.color)
             Spacer()
+            ClaudeCodeControl(
+                isActive: accounts.claudeCode.activeID == account.id,
+                canSwitch: accounts.claudeCodeSwitchable && accounts.claudeCode.savedIDs.contains(account.id),
+                isSwitching: accounts.claudeCodeSwitching == account.id,
+                action: { accounts.switchClaudeCode(to: account.id) })
             if manager.isLoading {
                 Text("updating")
                     .font(.caption2)

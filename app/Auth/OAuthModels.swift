@@ -35,14 +35,17 @@ public struct OAuthTokens: Codable, Equatable {
 public struct StoredCredential: Codable, Equatable {
     public var oauth: OAuthTokens?
     public var cookie: String?
+    /// This account's copy of Claude Code's own login, used to switch Claude Code to it.
+    public var claudeCode: ClaudeCodeLogin?
 
-    public init(oauth: OAuthTokens? = nil, cookie: String? = nil) {
+    public init(oauth: OAuthTokens? = nil, cookie: String? = nil, claudeCode: ClaudeCodeLogin? = nil) {
         self.oauth = oauth
         self.cookie = cookie
+        self.claudeCode = claudeCode
     }
 
     public var isEmpty: Bool {
-        oauth == nil && (cookie ?? "").isEmpty
+        oauth == nil && (cookie ?? "").isEmpty && claudeCode == nil
     }
 }
 
